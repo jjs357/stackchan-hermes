@@ -20,6 +20,9 @@ Safety and privacy limits are built into the firmware rather than left to the AI
 - **Spoken commands and questions.** "Look left", "nod", "turn the camera on", "say good
   morning", or any question. Commands are carried out and confirmed in a few words; questions
   get a one- or two-sentence spoken answer.
+- **Follow-up questions.** For 2 minutes after the robot last spoke, the next question can
+  refer to the previous ones ("How many people live there?"). The tool server keeps these few
+  exchanges in memory only.
 - **Live camera view** on the robot's own screen (about 10 fps), switched off automatically after 2 minutes.
 - **"What do you see?"** A photo is described by a local vision model (gemma3 via Ollama), and
   only the text description reaches the agent. The photo is deleted.
@@ -140,8 +143,9 @@ This is an outline, not a step-by-step tutorial. Read `SETUP-STATUS.md` for the 
              toolsets: [stackchan]
              deliver: log
              prompt: |
-               Someone just held the StackChan robot's head and spoke. Call hear_clip with
-               clip {clip} to get their words, then respond through the robot tools only ...
+               Someone just touched the StackChan robot's head and spoke. Call hear_clip with
+               clip {clip} to get their words. If hear_clip also shows earlier exchanges, use
+               them to understand follow-ups. Then respond through the robot tools only ...
    ```
 
    Then `hermes gateway restart`. A `robot-text` route with a `{text}` prompt is handy for typed
@@ -170,7 +174,6 @@ This is an outline, not a step-by-step tutorial. Read `SETUP-STATUS.md` for the 
 
 ## Roadmap
 
-- Follow-up context, so the next question can refer to the previous answer
 - Faster replies (currently about 8–30 s from tap to speech)
 - Running the `stackchan` profile on a local model (Ollama) so no text leaves the Mac
 

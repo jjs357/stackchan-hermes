@@ -8,8 +8,13 @@ Each tool runs one of the project's tested scripts with checked arguments, never
   look()           ../R34_HermesMoveCamera/r34-look.sh — local gemma3 text; photo deleted
   hear(secs)       ../R5_HermesListen/r5-hear.sh   — local whisper text; audio deleted
   camera_view(on)  r7-view.sh                      — live camera picture on the robot's screen
-  hear_clip(clip)  r7-clip.sh                      — a held-to-talk clip as local whisper text;
+  hear_clip(clip)  r7-clip.sh                      — a tap-to-talk clip as local whisper text;
                                                      the robot hands it out once, audio deleted
+
+Follow-up context: every robot turn is a fresh Hermes session, so this server remembers the
+last few exchanges (words heard by hear_clip, words spoken by say) for TALK_WINDOW_S and adds
+them to the next hear_clip result. Kept in memory only: never logged or written to disk, and
+gone when the window passes or the gateway restarts this server.
 
 The robot still enforces its own token, limits, cooldowns and QUIET mode. This server adds
 a call limit (30 per 10 minutes) and logs one line per call (time, tool, result) without content.
@@ -102,9 +107,10 @@ TOOLS = [
     },
     {
         "name": "hear_clip",
-        "description": "Get the words of a voice clip someone recorded by holding the robot's head "
+        "description": "Get the words of a voice clip someone recorded by touching the robot's head "
                        "(the clip number comes with the request). Returns the text transcript made "
-                       "locally on the Mac. Each clip can be taken once; the audio is deleted.",
+                       "locally on the Mac, plus any exchanges from the last 2 minutes so follow-up "
+                       "questions make sense. Each clip can be taken once; the audio is deleted.",
         "inputSchema": {
             "type": "object",
             "properties": {"clip": {"type": "integer", "minimum": 1, "maximum": 999999999}},
@@ -116,6 +122,10 @@ TOOLS = [
 
 call_times = []  # time.monotonic() of recent calls
 last_move_end = None  # time.monotonic() of the last reply to a move request
+
+TALK_WINDOW_S = 120  # an exchange is kept this long after its last words
+TALK_MAX_TURNS = 3
+talk_turns = []  # oldest first: {"t": time.monotonic() of last words, "heard": str, "said": [str]}
 
 
 def log(tool, outcome):
@@ -190,6 +200,10 @@ def tool_say(args):
     ok, out = run("R2_HermesGreeting/r2-say.sh", text, timeout=40)
     if not ok:
         raise ToolError(f"robot did not speak: {out.splitlines()[0] if out else 'no reply'}")
+    prune_talk()
+    if talk_turns:
+        talk_turns[-1]["said"].append(text)
+        talk_turns[-1]["t"] = time.monotonic()
     return "spoken"
 
 
@@ -248,7 +262,23 @@ def tool_hear_clip(args):
     ok, out = run("R7_HermesTalk/r7-clip.sh", str(clip), timeout=60)
     if not ok:
         raise ToolError(f"no clip: {out.splitlines()[-1] if out else 'no reply'}")
-    return out
+    prune_talk()
+    earlier = []
+    for turn in talk_turns:
+        earlier.append(f"Person: {turn['heard']}")
+        if turn["said"]:
+            earlier.append("Robot: " + " ".join(turn["said"]))
+    talk_turns.append({"t": time.monotonic(), "heard": out, "said": []})
+    del talk_turns[:-TALK_MAX_TURNS]
+    if not earlier:
+        return out
+    return ("Earlier in this conversation (last 2 minutes, oldest first):\n" + "\n".join(earlier)
+            + "\n\nJust now the person said: " + out)
+
+
+def prune_talk():
+    now = time.monotonic()
+    talk_turns[:] = [t for t in talk_turns if now - t["t"] < TALK_WINDOW_S]
 
 
 HANDLERS = {"say": tool_say, "gesture": tool_gesture, "look": tool_look, "hear": tool_hear,
@@ -305,7 +335,7 @@ def main():
             continue  # notifications (e.g. notifications/initialized) need no reply
         if method == "initialize":
             reply(msg_id, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                           "serverInfo": {"name": "stackchan-tools", "version": "0.4.0"}})
+                           "serverInfo": {"name": "stackchan-tools", "version": "0.5.0"}})
         elif method == "ping":
             reply(msg_id, {})
         elif method == "tools/list":
