@@ -103,10 +103,11 @@ and a Mac on the same Wi-Fi network.
   tool server, and `whisper-cli` as the fallback) and the `ggml-base.en.bin` model
   in `R5_HermesListen/models/` (not in the repository: about 141 MB)
 - [Ollama](https://ollama.com/) with `gemma3`, only for "what do you see?"
-- A model provider for the Hermes profile. The robot now runs on `minimax-m3.1-flash:cloud`
-  through Ollama (`provider: custom`, `base_url: http://localhost:11434/v1`), which answered
-  about twice as fast as Claude Opus in our tests. Development used Claude Opus. Nothing in the
-  robot or tools depends on the model, as long as it supports tool calls.
+- A model provider for the Hermes profile. The robot runs on Claude Opus. We also tried
+  `minimax-m3.1-flash:cloud` through Ollama (`provider: custom`, `base_url: http://localhost:11434/v1`):
+  about twice as fast, but on a request it could not fulfil it looped through the robot tools,
+  including taking photos nobody asked for. Use a faster model only with the tool server's
+  per-turn limits in place (planned).
 
 ## Setup outline
 
