@@ -16,15 +16,24 @@ last few exchanges (words heard by hear_clip, words spoken by say) for TALK_WIND
 them to the next hear_clip result. Kept in memory only: never logged or written to disk, and
 gone when the window passes or the gateway restarts this server.
 
+Fast transcription: this server starts whisper.cpp's whisper-server (model checked against its
+published checksum) on 127.0.0.1:WHISPER_PORT from r7.conf and stops it on exit, so the model
+stays loaded between clips. r7-clip.sh uses it and falls back to whisper-cli if it is not up.
+Its output is discarded (it could contain transcripts); it runs in an empty private folder.
+
 The robot still enforces its own token, limits, cooldowns and QUIET mode. This server adds
 a call limit (30 per 10 minutes) and logs one line per call (time, tool, result) without content.
 Moves and camera_view retry while the robot answers 409 (busy: audio playing), since say returns
 before the robot has finished speaking.
 """
+import atexit
+import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -33,6 +42,11 @@ LOG = Path(__file__).resolve().parent / "logs" / "tools.log"
 # The gateway keeps one server process across many sessions, so the limit is a sliding window
 MAX_CALLS = 30  # R7b: a spoken turn uses hear_clip + an action + a spoken confirmation
 WINDOW_S = 600  # at most MAX_CALLS calls in any 10 minutes
+
+WHISPER_MODEL = PROJECT / "R5_HermesListen/models/ggml-base.en.bin"
+WHISPER_SHA256 = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"  # as r7-clip.sh
+WHISPER_HINT = "Stack Chan, StackChan robot."
+whisper_proc = None
 
 SAY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 .,!?'-]*$")
 SAY_MAX = 80
@@ -132,6 +146,49 @@ def log(tool, outcome):
     LOG.parent.mkdir(exist_ok=True)
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {tool} {outcome}\n")
+
+
+def conf_value(name):
+    """One NAME=value line from r7.conf (parsed, never sourced)."""
+    for line in (PROJECT / "R7_HermesTalk/r7.conf").read_text().splitlines():
+        if line.startswith(name + "="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def ensure_whisper():
+    """Start whisper-server unless it is running; on any problem leave r7-clip.sh to whisper-cli."""
+    global whisper_proc
+    if whisper_proc is not None and whisper_proc.poll() is None:
+        return
+    whisper_proc = None
+    port = conf_value("WHISPER_PORT")
+    binary = shutil.which("whisper-server")
+    if not port.isdigit() or not binary or not WHISPER_MODEL.is_file():
+        log("whisper-server", "not-started")
+        return
+    with open(WHISPER_MODEL, "rb") as f:
+        if hashlib.file_digest(f, "sha256").hexdigest() != WHISPER_SHA256:
+            log("whisper-server", "bad-model")
+            return
+    threads = subprocess.run(["sysctl", "-n", "hw.physicalcpu"], capture_output=True, text=True).stdout.strip()
+    workdir = tempfile.mkdtemp(prefix="whisper-server-")  # empty: nothing to serve, nothing kept
+    whisper_proc = subprocess.Popen(
+        [binary, "--host", "127.0.0.1", "--port", port, "-m", str(WHISPER_MODEL), "-l", "en", "-nt",
+         "-t", threads if threads.isdigit() else "4", "--prompt", WHISPER_HINT, "--public", workdir],
+        cwd=workdir, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    atexit.register(stop_whisper, whisper_proc, workdir)
+    log("whisper-server", "started")
+
+
+def stop_whisper(proc, workdir):
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    shutil.rmtree(workdir, ignore_errors=True)
 
 
 def run(script, *args, timeout):
@@ -259,6 +316,7 @@ def tool_hear_clip(args):
     clip = args.get("clip")
     if not isinstance(clip, int) or isinstance(clip, bool) or not 1 <= clip <= 999999999:
         raise ToolError("clip must be an integer 1..999999999")
+    ensure_whisper()  # restarts it if it has stopped; this clip may still use whisper-cli
     ok, out = run("R7_HermesTalk/r7-clip.sh", str(clip), timeout=60)
     if not ok:
         raise ToolError(f"no clip: {out.splitlines()[-1] if out else 'no reply'}")
@@ -320,6 +378,7 @@ def reply(msg_id, result=None, error=None):
 
 
 def main():
+    ensure_whisper()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -335,7 +394,7 @@ def main():
             continue  # notifications (e.g. notifications/initialized) need no reply
         if method == "initialize":
             reply(msg_id, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                           "serverInfo": {"name": "stackchan-tools", "version": "0.5.0"}})
+                           "serverInfo": {"name": "stackchan-tools", "version": "0.6.0"}})
         elif method == "ping":
             reply(msg_id, {})
         elif method == "tools/list":

@@ -14,7 +14,8 @@ Safety and privacy limits are built into the firmware rather than left to the AI
 
 ## What it does today
 
-- **Tap to talk.** A tap (or a 1 s hold) on the head starts a 5 s recording. The robot beeps,
+- **Tap to talk.** A tap (or a 1 s hold) on the head starts a recording that ends 1.2 s after
+  you stop speaking (at most 8 s). The robot beeps,
   shows a red **MIC REC** banner, then sends a signed notice to Hermes on the Mac. Hermes fetches
   the clip, transcribes it locally with whisper.cpp, and replies through the robot.
 - **Spoken commands and questions.** "Look left", "nod", "turn the camera on", "say good
@@ -98,7 +99,8 @@ and a Mac on the same Wi-Fi network.
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) with the gateway running
 - Python 3 (standard library only)
-- [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`whisper-cli`) and the `ggml-base.en.bin` model
+- [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`whisper-server`, kept running on 127.0.0.1 by the
+  tool server, and `whisper-cli` as the fallback) and the `ggml-base.en.bin` model
   in `R5_HermesListen/models/` (not in the repository: about 141 MB)
 - [Ollama](https://ollama.com/) with `gemma3`, only for "what do you see?"
 - A model provider for the Hermes profile. The robot now runs on `minimax-m3.1-flash:cloud`
@@ -179,7 +181,7 @@ This is an outline, not a step-by-step tutorial. Read `SETUP-STATUS.md` for the 
 
 ## Roadmap
 
-- Faster replies (now about 6–8 s from the webhook to speech, plus the 5 s recording)
+- Faster replies (now about 3.5 s from the webhook to the first robot action, plus the recording, which ends 1.2 s after you stop speaking)
 - Running the `stackchan` profile on a local model (Ollama) so no text leaves the Mac
 
 ## Acknowledgements

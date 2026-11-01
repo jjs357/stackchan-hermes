@@ -25,17 +25,27 @@ clip="${1:-}"
 # Parse settings instead of sourcing them, so the file cannot run code
 ip="$(sed -n 's/^ROBOT_IP=//p' "$conf")"
 port="$(sed -n 's/^ROBOT_PORT=//p' "$conf")"
+wport="$(sed -n 's/^WHISPER_PORT=//p' "$conf")"
 if ! [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ && "$port" =~ ^[0-9]{1,5}$ ]]; then
     echo "error: ROBOT_IP/ROBOT_PORT missing or invalid in r7.conf" >&2
     exit 2
 fi
 
-# 1. Check the transcriber before taking the clip (taking it wipes it on the robot)
-command -v whisper-cli >/dev/null || { echo "error: whisper-cli not installed" >&2; exit 1; }
-[[ -f "$model" ]] || { echo "error: model missing: $model" >&2; exit 1; }
-if [[ "$(shasum -a 256 "$model" | cut -d' ' -f1)" != "$model_sha256" ]]; then
-    echo "error: model checksum does not match the published value; refusing to use it" >&2
-    exit 1
+now() { perl -MTime::HiRes=time -e 'printf "%d", time * 1000'; }
+
+# 1. Check the transcriber before taking the clip (taking it wipes it on the robot). A running
+#    whisper-server checked the model when stackchan_tools.py started it, so the 0.7 s checksum
+#    is only needed for the whisper-cli fallback.
+server_up=false
+if [[ "$wport" =~ ^[0-9]{1,5}$ ]] && curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$wport/"; then
+    server_up=true
+else
+    command -v whisper-cli >/dev/null || { echo "error: whisper-cli not installed" >&2; exit 1; }
+    [[ -f "$model" ]] || { echo "error: model missing: $model" >&2; exit 1; }
+    if [[ "$(shasum -a 256 "$model" | cut -d' ' -f1)" != "$model_sha256" ]]; then
+        echo "error: model checksum does not match the published value; refusing to use it" >&2
+        exit 1
+    fi
 fi
 
 # 2. Take the clip, into a private temp folder only
@@ -52,12 +62,14 @@ fi
 # so the token never appears in any process's argument list
 meta="$(curl -sS --max-time 15 -X POST \
     -H @<(printf 'Authorization: Bearer %s\n' "$token") \
-    -o "$audio" -w '%{http_code} %{content_type} %{header_json}' \
+    -o "$audio" -w '%{http_code} %{content_type} %{time_total} %{header_json}' \
     "http://$ip:$port/voice/take?clip=$clip")"
 unset token
 code="${meta%% *}"
 rest="${meta#* }"
 ctype="${rest%% *}"
+rest="${rest#* }"
+download_s="${rest%% *}"
 
 if [[ "$code" != "200" ]]; then
     # Errors are short JSON messages from the sketch
@@ -80,16 +92,29 @@ if [[ "$(head -c 4 "$audio")" != "RIFF" || "$(dd if="$audio" bs=1 skip=8 count=8
 fi
 hdr() { printf '%s' "$rest" | sed -n "s/.*\"$1\":\[\"\([0-9]*\)\"\].*/\1/p"; }
 
-# 3. Transcribe offline; the trap deletes the audio and transcript afterwards
-start=$(date +%s)
-whisper-cli -m "$model" -f "$audio" -l en -t "$(sysctl -n hw.physicalcpu)" -nt -np \
-    --prompt "$hint" -otxt -of "$tmpdir/transcript" >/dev/null 2>"$tmpdir/whisper.log" \
-    || { echo "error: whisper-cli failed" >&2; exit 1; }
-secs_taken=$(( $(date +%s) - start ))
+# 3. Transcribe offline; the trap deletes the audio and transcript afterwards. The whisper-server
+#    that stackchan_tools.py keeps on 127.0.0.1 has the model loaded already; whisper-cli
+#    (which loads it each time) is the fallback.
+start=$(now)
+engine="whisper-server"
+if ! $server_up ||
+   ! curl -sS --max-time 30 -o "$tmpdir/transcript.txt" -F file=@"$audio" -F response_format=text \
+        -F temperature=0 "http://127.0.0.1:$wport/inference" 2>/dev/null ||
+   grep -q '^{"error"' "$tmpdir/transcript.txt"; then
+    engine="whisper-cli"
+    if [[ "$(shasum -a 256 "$model" | cut -d' ' -f1)" != "$model_sha256" ]]; then
+        echo "error: model checksum does not match the published value; refusing to use it" >&2
+        exit 1
+    fi
+    whisper-cli -m "$model" -f "$audio" -l en -t "$(sysctl -n hw.physicalcpu)" -nt -np \
+        --prompt "$hint" -otxt -of "$tmpdir/transcript" >/dev/null 2>"$tmpdir/whisper.log" \
+        || { echo "error: whisper-cli failed" >&2; exit 1; }
+fi
+transcribe_ms=$(( $(now) - start ))
 text="$(sed 's/^[[:space:]]*//' "$tmpdir/transcript.txt" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
 [[ -n "$text" ]] || text="(no speech recognised)"
 
 clip_ms=$(( (size - 44) * 1000 / 32000 ))
 echo "clip $clip: $(( clip_ms / 1000 )).$(( clip_ms % 1000 / 100 )) s (peak $(hdr x-peak), rms $(hdr x-rms) of 32767), deleted after transcription"
-echo "transcript by whisper.cpp base.en (local, ${secs_taken} s):"
+echo "transcript by whisper.cpp base.en ($engine, local; download ${download_s} s, transcription $(( transcribe_ms / 1000 )).$(( transcribe_ms % 1000 / 100 )) s):"
 echo "$text"

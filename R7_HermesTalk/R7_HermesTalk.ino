@@ -3,6 +3,10 @@
  * plus a sprite-based screen, a camera view on the robot's own screen (R7a) and
  * hold-to-talk with Hermes (R7b).
  *
+ * v0.12.1, changes from v0.12.0:
+ *   - A clip ends after 1.2 s of quiet (VOICE_END_QUIET_CHUNKS 12, was 8): a 0.8 s thinking
+ *     pause mid-sentence cut a question short in the v0.12.0 robot test
+ *
  * v0.12.0, changes from v0.11.0:
  *   - Talk stops recording when the person stops speaking: the clip is recorded in 100 ms
  *     pieces (VOICE_CHUNK) and ends after VOICE_END_QUIET_CHUNKS quiet pieces (0.8 s) that
@@ -158,7 +162,7 @@
 extern "C" int SCCB_Deinit(void);
 
 static const char* SKETCH_NAME      = "R7_HermesTalk";
-static const char* SKETCH_VERSION   = "0.12.0";
+static const char* SKETCH_VERSION   = "0.12.1";
 static const uint16_t HTTP_PORT     = 8080;
 static const size_t MIN_TOKEN_LEN   = 16;
 static const size_t MAX_WAV_BYTES   = 192 * 1024;
@@ -262,7 +266,7 @@ static const int VOICE_MAX_SECS        = MIC_MAX_SECS;  // 8 s
 static const size_t VOICE_WAV_BYTES    = WAV_HEADER_BYTES + (size_t)VOICE_MAX_SECS * MIC_RATE * 2;
 static const size_t VOICE_CHUNK        = MIC_RATE / 10;  // 100 ms pieces, checked as they arrive
 static const int VOICE_SPEECH_RMS      = 200;    // a piece this loud is speech (room ~17, speech ~1300 average)
-static const size_t VOICE_END_QUIET_CHUNKS = 8;  // 0.8 s quiet after speech ends the clip
+static const size_t VOICE_END_QUIET_CHUNKS = 12; // 1.2 s quiet after speech ends the clip
 static const size_t VOICE_MIN_CHUNKS   = 10;     // never shorter than 1 s
 static const size_t VOICE_NO_SPEECH_CHUNKS = 30; // no speech in the first 3 s = nothing said
 static const uint32_t VOICE_KEEP_MS    = 60000;  // a clip nobody took is wiped after this
