@@ -41,14 +41,22 @@ trap 'rm -rf "$tmpdir"' EXIT
 img="$tmpdir/photo.jpg"
 
 # 1. Check the model before taking a photo: local (not ":cloud") and able to see images
+# /api/show no longer marks cloud models (Ollama 0.40.13), so /api/tags and the name are checked too
 curl -sS --max-time 10 "$ollama/api/show" -d "{\"model\":\"$model\"}" -o "$tmpdir/show.json" \
+    && curl -sS --max-time 10 "$ollama/api/tags" -o "$tmpdir/tags.json" \
     || { echo "error: Ollama is not reachable at $ollama (is the Ollama app running?)" >&2; exit 1; }
-python3 -I - "$tmpdir/show.json" <<'EOF' || exit 1
+python3 -I - "$tmpdir/show.json" "$tmpdir/tags.json" "$model" <<'EOF' || exit 1
 import json, sys
 d = json.load(open(sys.argv[1]))
+model = sys.argv[3]
 if "error" in d:
     sys.exit("error: Ollama: " + str(d["error"]))
-if d.get("remote_host") or d.get("remote_model"):
+names = {model, model if ":" in model else model + ":latest"}
+tags = [m for m in json.load(open(sys.argv[2])).get("models", []) if m.get("name") in names]
+if not tags:
+    sys.exit("error: model is not in Ollama's local list; refusing to send the image")
+if (model.split(":")[-1].endswith("cloud") or d.get("remote_host") or d.get("remote_model")
+        or any(m.get("remote_host") or m.get("remote_model") for m in tags)):
     sys.exit("error: model is cloud-backed; refusing to send the image")
 if "vision" not in (d.get("capabilities") or []):
     sys.exit("error: model does not support images")
