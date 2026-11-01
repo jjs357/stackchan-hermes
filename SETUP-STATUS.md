@@ -2,6 +2,13 @@
 
 Last updated: 2026-11-01 · R1–R7a complete · R7b core complete (robot on R7_HermesTalk v0.11.0)
 
+**Latest (2026-11-01), details in section 3, end of the "Approved by the user" table:**
+- v0.11.0: a tap now starts talk, the same as a hold (tap gesture removed); left/right poses ±13° so turns are one motion
+- Follow-up questions: `stackchan_tools.py` 0.5.0 remembers the last 3 exchanges for 2 minutes
+- Faster replies, item 1: robot tools listed up front (tool search off) → about 2 s saved; webhook → speech now ~14–17 s
+- Next: compare an Ollama cloud model against Opus for reply speed
+- Project published at https://github.com/jjs357/stackchan-hermes
+
 No secrets, tokens, or credential values appear in this file. Credentials were
 checked for presence only. Personal machine details (hardware, accounts, host names,
 network addresses) are kept out of this public copy.
@@ -343,6 +350,6 @@ Milestones, each a separate approval:
 | ~~R5~~ | ~~Microphone~~ — **PASSED 2026-10-29** (`R5_HermesListen` v0.7.0: record-on-request with beep + banner; local whisper.cpp base.en; Hermes hears via `r5-hear.sh`, text only) | microphone — **consent of people in earshot** | audio local; transcript text to Anthropic |
 | ~~R6~~ | ~~Touch to hear~~ — **PASSED 2026-10-30**: R6a taps + QUIET; R6b robot-only `stackchan` Hermes profile (say/gesture/look/hear); R6c `r6-echo.sh` tap → record → local transcript → robot says "I heard, …" (sketch v0.8.1) | touch sensor, mic, speaker, servos | R6c fully local; R6b text to Anthropic |
 | R7a (done) | Spoken commands (local fixed list: look left/right/up/down, centre, nod, say …, what do you see, camera on/off) + camera view on the robot's screen. R7a-1 sketch v0.9.0 **PASSED 2026-10-31** (live view 10 fps in stream mode, taps/mic/photo work during it); R7a-2 listener `r7-talk.py` robot batch **14/15 OK**, tap 13 429 fixed (listener waits out the 10 s recording cooldown), recheck **PASSED**. **R7a COMPLETE 2026-10-31** | touch sensor, mic, speaker, servos, camera (screen only) | fully local; nothing leaves Mac/robot |
-| R7b (core done 2026-11-01: hold-to-talk v0.10.0 passed step 5) | Question answering: non-command utterance → Hermes `stackchan` profile → spoken answer (≤80-char clips, THINKING cue, short follow-up window). Also: tool server retry on 409, say-then-gesture timing, start-up no-tools quirk | as R7a | transcript text to Anthropic |
+| R7b (core done 2026-11-01: talk v0.10.0/v0.11.0, follow-ups, tool search off; reply speed in progress) | Question answering: utterance → Hermes `stackchan` profile → spoken answer (≤80-char clips, THINKING cue). **Done:** tap/hold to talk, 409 retry, 2-minute follow-up window, one-motion turns, tools listed up front. **Open:** faster replies (Ollama cloud model comparison; transcribe before Hermes starts; stop recording at silence) | as R7a | transcript text to Anthropic |
 
 Not done and not planned without approval: firmware upload, flashing, startup services, public ports, autonomous behaviour.
