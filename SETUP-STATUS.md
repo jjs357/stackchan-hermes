@@ -2,7 +2,7 @@
 
 Last updated: 2026-11-01 · R1–R7a complete · R7b core complete (robot on R7_HermesTalk v0.11.0)
 
-**Latest (2026-11-01), details in section 3, end of the "Approved by the user" table:**
+**Latest (2026-11-01), details in section 3, "Approved by the user" table, rows starting "R7b" and after:**
 - v0.11.0: a tap now starts talk, the same as a hold (tap gesture removed); left/right poses ±13° so turns are one motion
 - Follow-up questions: `stackchan_tools.py` 0.5.0 remembers the last 3 exchanges for 2 minutes
 - Faster replies, item 1: robot tools listed up front (tool search off) → about 2 s saved; webhook → speech now ~14–17 s
