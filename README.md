@@ -123,6 +123,9 @@ This is an outline, not a step-by-step tutorial. Read `SETUP-STATUS.md` for the 
      stackchan:
        command: /path/to/python3
        args: [-I, /path/to/R7_HermesTalk/stackchan_tools.py]
+   tools:
+     tool_search:
+       enabled: "off"   # list the 6 robot tools up front: saves a model round trip per turn
    ```
 
 6. **Webhook routes.** Add the routes to the gateway config (`~/.hermes/config.yaml`), with the
