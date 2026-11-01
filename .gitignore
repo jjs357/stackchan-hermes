@@ -1,0 +1,29 @@
+# Secrets: never commit (each sketch folder also ignores its own secrets.h)
+secrets.h
+.env
+
+# Private notes, including the full unredacted build log
+private/
+
+# Robot data and large local files
+logs/
+captures/
+recordings/
+models/
+*.wav
+*.jpg
+
+# Backups of earlier versions (the history lives in SETUP-STATUS.md)
+*.bak
+*.bak-*
+
+# Pending permission from its authors (Eric and Tycho)
+STACKCHAN-AI-HELPER-START-HERE.md
+
+# Early Hermes tool test file
+hello-hermes.txt
+
+# Python and macOS clutter
+__pycache__/
+*.pyc
+.DS_Store

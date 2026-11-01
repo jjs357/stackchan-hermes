@@ -1,0 +1,1918 @@
+/*
+ * R7_HermesTalk — R6 (status, greeting, head movement, camera, microphone, head taps, QUIET)
+ * plus a sprite-based screen, a camera view on the robot's own screen (R7a) and
+ * hold-to-talk with Hermes (R7b).
+ *
+ * v0.11.0, changes from v0.10.0:
+ *   - A tap on the head now starts talk exactly like a hold (beep, record, webhook); the
+ *     look-up tap gesture, the Mac tap flag and GET /events + POST /events/ack are removed,
+ *     so the R7a listener r7-talk.py no longer works with this sketch (use v0.10.0 for it)
+ *   - /status drops tap_seq, tap_pending, gestures_done, gestures_skipped
+ *
+ * v0.10.0 (R7b), changes from v0.9.0:
+ *   - Hold the head touch sensor for HOLD_MS (1 s): the robot beeps, records VOICE_SECS (5 s)
+ *     with the MIC REC banner, keeps the clip in PSRAM and sends ONE signed webhook
+ *     {"clip":N} to the Hermes gateway on the Mac (HERMES_HOOK_HOST, port 8644). Hermes then
+ *     fetches the clip with POST /voice/take (token), which returns it once and wipes it.
+ *     A clip nobody takes is wiped after VOICE_KEEP_MS (60 s); turning QUIET on wipes it too.
+ *     A near-silent clip (rms < VOICE_MIN_RMS) is wiped at once and not sent.
+ *   - Shorter touches are taps exactly as before (Mac listener flag + look-up gesture)
+ *   - Webhook signing: generic HMAC V2 as the gateway expects, X-Webhook-Timestamp (unix s,
+ *     from NTP) and X-Webhook-Signature-V2 = hex HMAC-SHA256(secret, "<ts>.<body>"). No clock,
+ *     no talk. The webhook carries only the clip number, never audio or text.
+ *   - Blue THINKING banner from the webhook until the robot speaks, moves or shows the
+ *     camera, or THINK_MAX_MS (45 s); short maroon notices when talk is refused or fails
+ *   - The robot now starts contact with the Mac, but only this one webhook, and only after
+ *     someone holds its head
+ *   - /status: talk counters, clock_ok, hook_ok; the mDNS name stackchan.local is advertised
+ *
+ * v0.9.0 (R7a-1), changes from R6_HermesTouch v0.8.1:
+ *   - Screen is composed from sprites (PSRAM canvases): a status layer or the camera layer,
+ *     then banners (CAMERA, MIC REC, LIVE) on top, pushed in one go (no flicker)
+ *   - POST /camera/view?on=1|0 shows the camera on the robot's screen only (red LIVE frame
+ *     with a countdown); switched off after 2 minutes, by QUIET, or by a bus fault
+ *   - Head-touch chip health (touch_ok) in /status, and a baseline recalibration at start-up
+ *     and after each camera-view start/stop (R6c saw a whole boot with no taps)
+ *
+ * Builds on the tested R6_HermesTouch v0.8.1 (see ../SETUP-STATUS.md).
+ *
+ * Endpoints (all require header "Authorization: Bearer <token>"):
+ *   GET  /status                       — status, counters, bus health, quiet/tap state
+ *   POST /say                          — one short WAV, played once, quietly (as R2/R3)
+ *   POST /head/read                    — power servos briefly and report angles; no movement
+ *   POST /head/move?yaw=<n>&pitch=<n>  — one move, angles in tenths of a degree (as R3 v0.4.0)
+ *   POST /camera/snap                  — capture one 320x240 frame, returned as JPEG (as R4)
+ *   POST /camera/view?on=<1|0>         — camera view on the robot's screen on/off (R7a)
+ *   POST /mic/record?secs=<1..8>       — record once, returned as 16 kHz mono 16-bit WAV (as R5)
+ *   POST /voice/take?clip=<n>          — the held-to-talk clip n as WAV, once; then wiped (R7b)
+ *
+ * Touch:
+ *   - A tap or hold on the head touch sensor starts talk (see v0.11.0 / v0.10.0 above); the
+ *     10 s recording cooldown spaces talk turns
+ *   - QUIET mode: press and hold the screen to toggle. While quiet, head touches are ignored and
+ *     /say, /head/move, /camera/snap and /mic/record are refused (HTTP 423); a grey QUIET
+ *     banner is shown. QUIET is off after a restart.
+ *
+ * Microphone use:
+ *   - Records only during a /mic/record request, at most 8 s; nothing is stored on the
+ *     robot, streamed, or sent anywhere except the HTTP reply
+ *   - Before recording: red "MIC REC" banner and a short quiet beep; the banner counts
+ *     down while recording; 10 s cooldown between recordings
+ *   - Speaker and microphone share clock pins (BCK 34 / WS 33), so the speaker is stopped
+ *     for the recording and restarted afterwards (as in M5Unified's Microphone example)
+ *   - "Off": after recording, Mic.end() resets the ES7210 codec and powers down its inputs
+ *   - The reply carries X-Peak and X-Rms headers (signal level only), so a recording can
+ *     be checked for "not silent" without anyone listening to it
+ *
+ * Motion (as R3 v0.4.0): each move is ONE position command per servo with a travel time;
+ * the library still handles power, torque and the current sensor, its motion task is kept
+ * off the servo bus, and this sketch shares the library's servo UART.
+ *
+ * Movement safety (see move_rules.h):
+ *   - yaw -30°..+30°, pitch 10°..70° (M5Stack's documented safe pitch range is ~5°–85°)
+ *   - at most 30° per axis per move, travel time MOVE_MS_PER_DEG per degree, 3 s cooldown
+ *   - servo power is ON only during a read or move, then torque off and power OFF
+ *   - refuses to move if the servos report motion before any command, if a position
+ *     read fails, or if the servo calibration (zero positions) is missing
+ *   - aborts on a 4 s timeout or a sustained current spike by cutting servo power
+ *     (best effort: on USB power the current sensor may not see servo load)
+ *   - never calls goHome() (pitch 0°) or continuous rotation
+ *
+ * Camera (as R4): no frames except during a /camera/snap request or while the camera view
+ * is on; nothing stored on the robot or streamed off it; red CAMERA banner during a
+ * capture; 10 s cooldown between captures.
+ *
+ * Camera view (R7a): frames go only to the robot's screen, at most CAM_VIEW_FPS a second,
+ * inside a red LIVE frame with a countdown. Off after CAM_VIEW_MAX_MS, when QUIET is turned
+ * on, or after a bus fault; off after a restart. Two modes (CAM_VIEW_STREAM):
+ *   stream: the camera is set up once (control bus borrowed as below), then its control
+ *           bus driver is removed with SCCB_Deinit() and the internal I2C taken back while
+ *           frames keep arriving on the separate parallel data pins. The sensor runs its
+ *           own exposure, so nothing else is sent to it. Taps, mic and moves keep working.
+ *   slow:   fallback, one full hand-over (as for a snapshot) per frame, about 1 a second;
+ *           taps are noticed between frames only.
+ * A /camera/snap while streaming uses the current frame, without a hand-over.
+ *
+ * Shared bus: the camera's control bus and M5Unified's internal I2C bus (servo POWER
+ * switch, battery/current monitor, touch, speaker amplifier, power management) are the
+ * same pins and I2C port, so they take turns:
+ *   servo power off -> release internal I2C -> camera init -> one frame ->
+ *   camera deinit -> re-take internal I2C -> health check (battery reading)
+ * Requests are handled one at a time, so a capture never overlaps a move or head read.
+ * A capture is also refused while a clip is playing. If the health check fails, BOTH the
+ * camera and movement are disabled until restart, since servo power could no longer be
+ * switched reliably.
+ *
+ * Not used: LEDs, IR, NFC.
+ *
+ * Setup:
+ *   1. Copy your secrets.h (same token) into this folder. R7b adds HERMES_HOOK_HOST (the
+ *      Mac's name, e.g. "mymac.local") and HERMES_HOOK_SECRET (the gateway route's secret).
+ *   2. Board: Espressif "esp32" package -> "M5CoreS3", PSRAM enabled (the default).
+ *   3. Upload with the Arduino IDE.
+ *
+ * Mac scripts (unchanged, same IP/port): ../R3_HermesMove/r3-head.sh,
+ * ../R2_HermesGreeting/r2-say.sh, ../R4_HermesCamera/r4-snap.sh and r4-describe.sh.
+ *
+ * Camera pins and settings follow M5Stack's official M5CoreS3 library
+ * (src/utility/GC0308.cpp, MIT licence).
+ *
+ * Libraries: M5StackChan 1.1.1, M5Unified, M5GFX; esp32-camera ships with the esp32 core.
+ * Recovery: re-upload R6_HermesTouch or any sketch from your sketchbook.
+ */
+#include <Arduino.h>
+#include <M5StackChan.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ESPmDNS.h>
+#include <mbedtls/md.h>
+#include <time.h>
+#include <esp_heap_caps.h>
+#include <drivers/FTServo_Arduino/src/SCSCL.h>
+#include <utils/settings/settings.h>
+#include <esp_camera.h>
+#include <img_converters.h>
+#include "secrets.h"
+#include "move_rules.h"
+#include "move_outcome.h"
+
+#if !defined(HERMES_HOOK_HOST) || !defined(HERMES_HOOK_SECRET)
+#error "secrets.h needs HERMES_HOOK_HOST and HERMES_HOOK_SECRET for R7b hold-to-talk (see the header comment)"
+#endif
+
+/* Exported by the esp32-camera component (sccb.h is not a public header). Called a second
+ * time by esp_camera_deinit(), which is then a no-op because the driver no longer owns
+ * the I2C port (checked by disassembling the library in esp32s3-libs 3.3.12). */
+extern "C" int SCCB_Deinit(void);
+
+static const char* SKETCH_NAME      = "R7_HermesTalk";
+static const char* SKETCH_VERSION   = "0.11.0";
+static const uint16_t HTTP_PORT     = 8080;
+static const size_t MIN_TOKEN_LEN   = 16;
+static const size_t MAX_WAV_BYTES   = 192 * 1024;
+static const uint32_t MAX_WAV_MS    = 6000;
+static const uint32_t COOLDOWN_MS   = 5000;
+static const uint8_t SPEAKER_VOLUME = 128;  // of 255 (v0.8.1: 64 lost soft word endings)
+
+static const uint32_t MOVE_MS_PER_DEG    = 40;    // travel time per degree of the larger axis change
+static const uint32_t MOVE_MIN_MS        = 300;   // so 10° takes 400 ms and 30° takes 1200 ms
+static const uint32_t SERVO_SETTLE_MS    = 300;   // after power on, before the first check
+static const uint32_t SERVO_READY_MS     = 2000;  // give up if not quiet by then
+static const uint32_t SERVO_POLL_MS      = 100;
+static const int SERVO_QUIET_CHECKS      = 3;     // consecutive "not moving" answers needed
+static const uint32_t MOVE_TIMEOUT_MS    = 4000;
+static const uint32_t MOVE_HOLD_MS       = 300;   // after arrival, before torque off
+static const uint32_t MOVE_COOLDOWN_MS   = 3000;
+
+/* Servo bus details, as set up by M5StackChan 1.1.1 (M5StackChan.cpp servo_init) */
+static const uart_port_t SERVO_UART = UART_NUM_1;
+static const uint8_t YAW_ID         = 1;
+static const uint8_t PITCH_ID       = 2;
+static const int RAW_MIN            = 0;
+static const int RAW_MAX            = 1000;
+static const float STALL_DELTA_MA        = 1500.0f;
+static const uint32_t STALL_HOLD_MS      = 200;
+
+WebServer server(HTTP_PORT);
+
+static bool token_ok              = false;
+static uint32_t requests_served   = 0;
+static uint32_t requests_rejected = 0;
+static uint32_t clips_spoken      = 0;
+static uint32_t moves_done        = 0;
+static uint32_t last_draw_ms      = 0;
+static uint32_t last_play_ms      = 0;
+static bool has_played            = false;
+static uint32_t last_move_end_ms  = 0;
+static bool has_moved             = false;
+
+static const uint32_t SNAP_COOLDOWN_MS = 10000;
+static const int WARMUP_FRAMES         = 3;     // let auto exposure settle; these are discarded
+static const uint8_t JPEG_QUALITY      = 80;    // 0..100
+static const float BATTERY_V_MIN       = 2.5f;  // health check: a sane reading means the bus works
+static const float BATTERY_V_MAX       = 4.6f;
+
+static uint32_t photos_taken  = 0;
+static uint32_t camera_errors = 0;
+static uint32_t last_snap_ms  = 0;
+static bool has_snapped       = false;
+static bool bus_failed        = false;  // internal bus did not come back after a capture
+
+static const bool CAM_VIEW_STREAM      = true;    // false: slow fallback, one hand-over per frame
+static const uint32_t CAM_VIEW_MAX_MS  = 120000;  // camera view switches itself off after 2 minutes
+static const uint32_t CAM_VIEW_FPS     = 10;      // stream mode; drawing a frame takes ~40 ms
+static const uint32_t CAM_SLOW_GAP_MS  = 1000;    // slow mode: pause between hand-overs
+static const int CAM_VIEW_MAX_MISSES   = 3;       // consecutive missing frames before giving up
+                                                  // (each miss can block ~4 s in the driver)
+static const int LIVE_BORDER           = 4;
+
+static bool cam_view           = false;  // camera view on screen
+static bool cam_streaming      = false;  // camera driver running (stream mode only)
+static uint32_t cam_view_start_ms = 0;
+static uint32_t last_frame_ms  = 0;
+static int frame_misses        = 0;
+static uint32_t views_started  = 0;
+static uint32_t view_frames    = 0;
+static const char* view_end_reason = "none";
+
+/* Screen layers (R7a): status or camera below, banners on top, composed in screen_spr */
+static M5Canvas status_spr;
+static M5Canvas cam_spr;
+static M5Canvas screen_spr;
+static bool screen_ok        = false;  // all three canvases allocated
+static bool banner_on        = false;
+static uint16_t banner_bg    = TFT_RED;
+static char banner_text[32]  = "";
+
+static bool touch_ok          = false;  // head-touch chip answered on the internal bus
+static uint32_t touch_recals  = 0;
+
+static const uint32_t MIC_RATE        = 16000;
+static const int MIC_MAX_SECS         = 8;
+static const size_t MIC_WARMUP        = 2400;  // 150 ms recorded first and discarded (codec settling)
+static const uint32_t REC_COOLDOWN_MS = 10000;
+static const float CUE_HZ             = 880.0f;
+static const uint32_t CUE_MS          = 200;
+static const size_t WAV_HEADER_BYTES  = 44;
+
+static int16_t* rec_buf          = nullptr;  // PSRAM: warm-up + up to MIC_MAX_SECS of samples
+static uint32_t recordings_made  = 0;
+static uint32_t mic_errors       = 0;
+static uint32_t last_rec_ms      = 0;
+static bool has_recorded         = false;
+
+static bool quiet               = false;
+static uint32_t taps_ignored    = 0;  // head touches ignored while QUIET
+
+/* Hold-to-talk (R7b) */
+static const uint32_t HOLD_MS          = 1000;   // a hold reports once at 1 s, a tap on release; both talk
+static const int VOICE_SECS            = 5;
+static const size_t VOICE_WAV_BYTES    = WAV_HEADER_BYTES + (size_t)VOICE_SECS * MIC_RATE * 2;
+static const uint32_t VOICE_KEEP_MS    = 60000;  // a clip nobody took is wiped after this
+static const int VOICE_MIN_RMS         = 60;     // quieter than this = nothing said (room ~17, speech ~1300)
+static const uint32_t THINK_MAX_MS     = 45000;
+static const uint32_t NOTICE_MS        = 2500;
+static const uint16_t HOOK_PORT        = 8644;
+static const char* HOOK_PATH           = "/p/stackchan/webhooks/robot-voice";
+static const uint32_t HOOK_TIMEOUT_MS  = 3000;
+static const size_t MIN_HOOK_SECRET    = 32;
+static const time_t CLOCK_VALID_AFTER  = 1700000000;  // NTP has set the clock (Nov 2023)
+
+static uint8_t* voice_buf      = nullptr;  // PSRAM: WAV header + VOICE_SECS of samples
+static bool voice_ready        = false;    // a clip is waiting for /voice/take
+static uint32_t voice_seq      = 0;
+static uint32_t voice_ms       = 0;
+static int32_t voice_peak      = 0;
+static int voice_rms           = 0;
+static uint32_t voices_sent    = 0;
+static uint32_t voices_failed  = 0;
+static uint32_t voices_taken   = 0;
+static uint32_t voices_expired = 0;
+static uint32_t voices_silent  = 0;
+static const char* voice_last  = "none";
+static int last_hook_code      = 0;
+static bool hook_ok            = false;    // secret and host set in secrets.h
+static IPAddress hook_ip;                  // resolved HERMES_HOOK_HOST; 0.0.0.0 = not yet
+static uint32_t boot_id        = 0;        // random per boot, part of each webhook's X-Request-ID
+static bool thinking           = false;
+static uint32_t think_start_ms = 0;
+static uint32_t think_mark     = 0;        // activity count when thinking began
+static uint32_t notice_until_ms = 0;       // 0 = no notice banner showing
+
+static int last_yaw     = 0;
+static int last_pitch   = 0;
+static bool angles_known = false;
+
+/*
+ * Shares the UART the library already installed (a second begin() would fail),
+ * so this object only needs to know the port number.
+ */
+class SharedScsBus : public SCSCL {
+public:
+    void attach(uart_port_t port) { uart_num = port; }
+};
+static SharedScsBus bus;
+
+/* Calibrated raw position of 0° for each servo, read from the library's NVS settings */
+static int yaw_zero   = -1;
+static int pitch_zero = -1;
+static bool zero_ok   = false;
+
+static uint8_t* wav_buf = nullptr;
+static size_t wav_len   = 0;
+
+/* State of the current /say upload, decided when the upload starts */
+enum class SayState { None, Accepting, Unauthorized, Busy, Cooldown, NoBuffer, TooLarge, Aborted };
+static SayState say_state = SayState::None;
+
+/* ---------- auth ---------- */
+
+/* Constant-time comparison so response timing does not leak the token */
+static bool tokens_equal(const String& given, const char* expected)
+{
+    size_t len = strlen(expected);
+    if (given.length() != len) {
+        return false;
+    }
+    uint8_t diff = 0;
+    for (size_t i = 0; i < len; ++i) {
+        diff |= (uint8_t)given[i] ^ (uint8_t)expected[i];
+    }
+    return diff == 0;
+}
+
+static bool is_authorized()
+{
+    if (!token_ok || !server.hasHeader("Authorization")) {
+        return false;
+    }
+    String header = server.header("Authorization");
+    if (!header.startsWith("Bearer ")) {
+        return false;
+    }
+    return tokens_equal(header.substring(7), HERMES_STATUS_TOKEN);
+}
+
+static void send_json_error(int code, const char* msg)
+{
+    char body[160];
+    snprintf(body, sizeof(body), "{\"error\":\"%s\"}", msg);
+    server.send(code, "application/json", body);
+}
+
+/* ---------- WAV validation (unchanged from R2) ---------- */
+
+static uint16_t rd16(const uint8_t* p)
+{
+    return p[0] | (p[1] << 8);
+}
+
+static uint32_t rd32(const uint8_t* p)
+{
+    return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void wr32(uint8_t* p, uint32_t v)
+{
+    p[0] = v;
+    p[1] = v >> 8;
+    p[2] = v >> 16;
+    p[3] = v >> 24;
+}
+
+/*
+ * Validate the whole file against the received length. M5Unified's playWav walks
+ * chunks using the sizes inside the file, so a malformed file must never reach it.
+ * The walk below mirrors playWav's (no pad bytes) so both find the same data chunk.
+ */
+static const char* validate_wav(uint8_t* buf, size_t len)
+{
+    if (len < 44 || memcmp(buf, "RIFF", 4) || memcmp(buf + 8, "WAVEfmt ", 8)) {
+        return "not a RIFF/WAVE file with fmt first";
+    }
+    uint32_t fmt_size = rd32(buf + 16);
+    if (fmt_size < 16 || 20 + (size_t)fmt_size > len) {
+        return "bad fmt chunk";
+    }
+    uint16_t audio_fmt = rd16(buf + 20);
+    uint16_t channels  = rd16(buf + 22);
+    uint32_t rate      = rd32(buf + 24);
+    uint16_t bits      = rd16(buf + 34);
+    if (audio_fmt != 1 || channels != 1 || bits != 16 || rate < 8000 || rate > 24000) {
+        return "must be PCM mono 16-bit 8000-24000 Hz";
+    }
+
+    size_t off = 20 + fmt_size;
+    while (true) {
+        if (off + 8 > len) {
+            return "no data chunk";
+        }
+        uint32_t size = rd32(buf + off + 4);
+        if ((size_t)size > len - off - 8) {
+            return "chunk exceeds file";
+        }
+        if (!memcmp(buf + off, "data", 4)) {
+            if (size == 0) {
+                return "empty data chunk";
+            }
+            if ((uint64_t)size * 1000 / ((uint64_t)rate * 2) > MAX_WAV_MS) {
+                return "clip too long";
+            }
+            break;
+        }
+        off += 8 + size;
+    }
+
+    /* Make playWav's own bound match what we actually received */
+    wr32(buf + 4, len - 8);
+    return nullptr;
+}
+
+/* ---------- servo power and head helpers ---------- */
+
+static void servo_power_on()
+{
+    M5StackChan.setServoPowerEnabled(true);
+    delay(SERVO_SETTLE_MS);
+}
+
+static void servo_power_off()
+{
+    M5StackChan.Motion.setTorqueEnabled(false);
+    M5StackChan.setServoPowerEnabled(false);
+}
+
+/*
+ * With nothing commanded, a healthy head reports "not moving". A failed bus read
+ * (ReadMove returns -1) shows up as "moving", so this doubles as a link check.
+ */
+static bool servos_quiet()
+{
+    return !M5StackChan.Motion.isMoving();
+}
+
+/*
+ * Servos need a moment to boot after power on and fail reads until then.
+ * Poll until they answer "not moving" several times in a row, or give up.
+ */
+static uint32_t ready_waited_ms = 0;
+
+static bool servos_ready()
+{
+    uint32_t t0 = millis();
+    int quiet = 0;
+    while (millis() - t0 < SERVO_READY_MS) {
+        quiet = servos_quiet() ? quiet + 1 : 0;
+        if (quiet >= SERVO_QUIET_CHECKS) {
+            ready_waited_ms = SERVO_SETTLE_MS + (millis() - t0);
+            return true;
+        }
+        delay(SERVO_POLL_MS);
+    }
+    ready_waited_ms = SERVO_SETTLE_MS + (millis() - t0);
+    return false;
+}
+
+static void send_not_ready()
+{
+    char body[160];
+    snprintf(body, sizeof(body),
+             "{\"error\":\"servos not responding or already moving; power off\",\"waited_ms\":%lu}",
+             (unsigned long)ready_waited_ms);
+    server.send(503, "application/json", body);
+}
+
+/* Same conversions as the library: one raw step is 0.3125°, angles in tenths of a degree */
+static int angle_to_raw(int zero, int angle)
+{
+    return zero + angle * 16 / 5 / 10;
+}
+
+static int raw_to_angle(int zero, int raw)
+{
+    return (raw - zero) * 5 * 10 / 16;
+}
+
+static void load_servo_zeros()
+{
+    Settings settings("servo", false);  // read-only
+    yaw_zero   = settings.GetInt("zero_pos_1", -1);
+    pitch_zero = settings.GetInt("zero_pos_2", -1);
+    zero_ok    = yaw_zero >= RAW_MIN && yaw_zero <= RAW_MAX && pitch_zero >= RAW_MIN && pitch_zero <= RAW_MAX;
+}
+
+/*
+ * Reads both positions straight from the servos. Unlike the library's
+ * getCurrentAngle(), a failed read is reported instead of replaced by a guess.
+ */
+static bool read_angles(int& yaw, int& pitch)
+{
+    int yaw_raw   = bus.ReadPos(YAW_ID);
+    int pitch_raw = bus.ReadPos(PITCH_ID);
+    if (yaw_raw < RAW_MIN || yaw_raw > RAW_MAX || pitch_raw < RAW_MIN || pitch_raw > RAW_MAX) {
+        return false;
+    }
+    yaw          = raw_to_angle(yaw_zero, yaw_raw);
+    pitch        = raw_to_angle(pitch_zero, pitch_raw);
+    last_yaw     = yaw;
+    last_pitch   = pitch;
+    angles_known = true;
+    return true;
+}
+
+/* A failed read (-1) counts as still moving, so the timeout catches a lost link */
+static bool servos_arrived()
+{
+    return bus.ReadMove(YAW_ID) == 0 && bus.ReadMove(PITCH_ID) == 0;
+}
+
+/* ---------- camera (as R4_HermesCamera v0.5.0) ---------- */
+
+/* Same pins as M5Stack's official GC0308 driver for CoreS3; no XCLK, reset or power-down pin */
+static camera_config_t make_camera_config(bool stream)
+{
+    camera_config_t c = {};
+    c.pin_pwdn     = -1;
+    c.pin_reset    = -1;
+    c.pin_xclk     = -1;
+    c.pin_sccb_sda = 12;
+    c.pin_sccb_scl = 11;
+    c.pin_d7       = 47;
+    c.pin_d6       = 48;
+    c.pin_d5       = 16;
+    c.pin_d4       = 15;
+    c.pin_d3       = 42;
+    c.pin_d2       = 41;
+    c.pin_d1       = 40;
+    c.pin_d0       = 39;
+    c.pin_vsync    = 46;
+    c.pin_href     = 38;
+    c.pin_pclk     = 45;
+
+    c.xclk_freq_hz  = 20000000;
+    c.ledc_timer    = LEDC_TIMER_0;
+    c.ledc_channel  = LEDC_CHANNEL_0;
+    c.pixel_format  = PIXFORMAT_RGB565;  // the GC0308 has no JPEG mode; converted below
+    c.frame_size    = FRAMESIZE_QVGA;    // 320x240
+    c.jpeg_quality  = 0;
+    c.fb_count      = stream ? 2 : 1;  // stream: one frame filling while one is drawn
+    c.fb_location   = CAMERA_FB_IN_PSRAM;
+    c.grab_mode     = stream ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
+    c.sccb_i2c_port = -1;
+    return c;
+}
+
+static bool internal_bus_ok()
+{
+    float v = M5StackChan.getBatteryVoltage();
+    return v >= BATTERY_V_MIN && v <= BATTERY_V_MAX;
+}
+
+static const char* BUS_LOST = "internal bus did not recover; camera, mic and movement disabled until restart";
+
+/*
+ * One full hand-over (as R4): servo power off -> release internal I2C -> camera init ->
+ * warm-up frames -> use(frame) -> camera deinit -> re-take internal I2C -> health check.
+ * Returns nullptr on success, otherwise why. use() returns false if it could not use the frame.
+ */
+static const char* with_one_frame(bool (*use)(camera_fb_t*, void*), void* ctx)
+{
+    const char* why = nullptr;
+
+    M5StackChan.setServoPowerEnabled(false);  // already off between moves; make sure before giving up the bus
+    M5.In_I2C.release();
+
+    camera_config_t cfg = make_camera_config(false);
+    if (esp_camera_init(&cfg) != ESP_OK) {
+        why = "camera init failed";
+    } else {
+        for (int i = 0; i < WARMUP_FRAMES; i++) {
+            camera_fb_t* warm = esp_camera_fb_get();
+            if (warm) {
+                esp_camera_fb_return(warm);
+            }
+        }
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) {
+            why = "no frame";
+        } else {
+            if (!use(fb, ctx)) {
+                why = "frame could not be used";
+            }
+            esp_camera_fb_return(fb);
+        }
+        esp_camera_deinit();
+    }
+
+    M5.In_I2C.begin();
+    if (!internal_bus_ok()) {
+        bus_failed = true;
+        why        = BUS_LOST;
+    }
+    return why;
+}
+
+struct JpegOut {
+    uint8_t* jpg = nullptr;
+    size_t len   = 0;
+};
+
+static bool frame_to_jpeg(camera_fb_t* fb, void* ctx)
+{
+    JpegOut* out = (JpegOut*)ctx;
+    if (!frame2jpg(fb, JPEG_QUALITY, &out->jpg, &out->len)) {
+        out->jpg = nullptr;
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Capture one frame and convert it to JPEG. Returns a malloc'd buffer the caller
+ * must free(), or nullptr with *why set. While the camera view streams, the current
+ * frame is used; otherwise one full hand-over, which always hands the bus back.
+ */
+static uint8_t* capture_jpeg(size_t* out_len, const char** why)
+{
+    JpegOut out;
+    *why = nullptr;
+
+    if (cam_streaming) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) {
+            *why = "no frame";
+        } else {
+            if (!frame_to_jpeg(fb, &out)) {
+                *why = "jpeg conversion failed";
+            }
+            esp_camera_fb_return(fb);
+        }
+    } else {
+        *why = with_one_frame(frame_to_jpeg, &out);
+        if (*why && out.jpg) {
+            free(out.jpg);  // e.g. converted, then the bus check failed
+            out.jpg = nullptr;
+        }
+    }
+    *out_len = out.jpg ? out.len : 0;
+    return out.jpg;
+}
+
+/* ---------- camera view on the robot's screen (R7a) ---------- */
+
+static bool frame_to_screen(camera_fb_t* fb, void* ctx)
+{
+    if (fb->format != PIXFORMAT_RGB565 || (int)fb->width != cam_spr.width() ||
+        (int)fb->height != cam_spr.height()) {
+        return false;
+    }
+    /* The camera sends RGB565 high byte first, which is M5GFX's default for uint16_t data */
+    cam_spr.pushImage(0, 0, fb->width, fb->height, (const uint16_t*)fb->buf);
+    return true;
+}
+
+/* Re-take the head-touch baseline after bus or power disturbances (library recommendation) */
+static void touch_recalibrate()
+{
+    M5StackChan.TouchSensor.recalibrate();
+    touch_recals++;
+}
+
+static bool touch_chip_ok()
+{
+    touch_ok = M5.In_I2C.scanID(SI12T_GND_ADDRESS);
+    return touch_ok;
+}
+
+/* Returns nullptr on success, otherwise why (and the view stays off) */
+static const char* view_start()
+{
+    if (CAM_VIEW_STREAM) {
+        M5StackChan.setServoPowerEnabled(false);
+        M5.In_I2C.release();
+
+        camera_config_t cfg = make_camera_config(true);
+        bool init_ok        = esp_camera_init(&cfg) == ESP_OK;
+        /* The sensor is configured now; drop the camera's control-bus driver so the internal
+         * I2C can have the pins back while frames keep arriving on the data pins */
+        SCCB_Deinit();
+        M5.In_I2C.begin();
+
+        if (!internal_bus_ok()) {
+            if (init_ok) {
+                esp_camera_deinit();
+            }
+            bus_failed = true;
+            return BUS_LOST;
+        }
+        if (!init_ok) {
+            return "camera init failed";
+        }
+        cam_streaming = true;
+    }
+
+    cam_view          = true;
+    cam_view_start_ms = millis();
+    last_frame_ms     = 0;
+    frame_misses      = 0;
+    views_started++;
+    cam_spr.fillScreen(TFT_BLACK);
+    touch_recalibrate();
+    return nullptr;
+}
+
+static void view_stop(const char* reason)
+{
+    if (!cam_view) {
+        return;
+    }
+    if (cam_streaming) {
+        esp_camera_deinit();  // stops the data pins; no control-bus traffic
+        cam_streaming = false;
+    }
+    cam_view        = false;
+    view_end_reason = reason;
+    if (!internal_bus_ok()) {
+        bus_failed = true;
+    } else {
+        touch_recalibrate();
+    }
+    last_draw_ms = millis();
+    draw_screen();
+}
+
+/* Called from loop(): next frame when due, and the automatic switch-off */
+static void view_tick()
+{
+    if (!cam_view) {
+        return;
+    }
+    if (millis() - cam_view_start_ms >= CAM_VIEW_MAX_MS) {
+        view_stop("timeout");
+        return;
+    }
+    uint32_t gap = CAM_VIEW_STREAM ? 1000 / CAM_VIEW_FPS : CAM_SLOW_GAP_MS;
+    if (last_frame_ms && millis() - last_frame_ms < gap) {
+        return;
+    }
+    last_frame_ms = millis();
+
+    bool got = false;
+    if (cam_streaming) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (fb) {
+            got = frame_to_screen(fb, nullptr);
+            esp_camera_fb_return(fb);
+        }
+    } else {
+        const char* why = with_one_frame(frame_to_screen, nullptr);
+        got             = why == nullptr;
+        if (why == BUS_LOST) {
+            camera_errors++;
+            view_stop("bus fault");
+            return;
+        }
+        last_frame_ms = millis();  // the gap counts from the end of a slow hand-over
+    }
+
+    if (got) {
+        frame_misses = 0;
+        view_frames++;
+    } else if (++frame_misses >= CAM_VIEW_MAX_MISSES) {
+        camera_errors++;
+        view_stop("no frames");
+        return;
+    }
+    compose_screen();
+}
+
+static void handle_camera_view()
+{
+    if (!is_authorized()) {
+        requests_rejected++;
+        send_json_error(401, "unauthorized");
+        return;
+    }
+    String arg = server.hasArg("on") ? server.arg("on") : String("");
+    if (arg != "0" && arg != "1") {
+        send_json_error(400, "need on=1 or on=0");
+        return;
+    }
+
+    if (arg == "0") {
+        view_stop("request");
+    } else {
+        if (bus_failed) {
+            send_json_error(503, "camera disabled until restart (internal bus check failed)");
+            return;
+        }
+        if (!screen_ok) {
+            send_json_error(503, "no screen buffers (PSRAM?)");
+            return;
+        }
+        if (refused_quiet()) {
+            return;
+        }
+        if (M5.Speaker.isPlaying()) {
+            send_json_error(409, "busy: audio playing");
+            return;
+        }
+        if (cam_view) {
+            cam_view_start_ms = millis();  // already on: restart the 2 minutes
+        } else {
+            const char* why = view_start();
+            if (why) {
+                camera_errors++;
+                last_draw_ms = millis();
+                draw_screen();
+                send_json_error(500, why);
+                return;
+            }
+        }
+    }
+
+    requests_served++;
+    char body[160];
+    snprintf(body, sizeof(body), "{\"camera_view\":%s,\"mode\":\"%s\",\"auto_off_s\":%lu,\"views_started\":%lu}",
+             cam_view ? "true" : "false", CAM_VIEW_STREAM ? "stream" : "slow",
+             cam_view ? (unsigned long)((CAM_VIEW_MAX_MS - (millis() - cam_view_start_ms)) / 1000) : 0UL,
+             (unsigned long)views_started);
+    server.send(200, "application/json", body);
+}
+
+/* ---------- handlers ---------- */
+
+static void handle_status()
+{
+    if (!is_authorized()) {
+        requests_rejected++;
+        send_json_error(401, "unauthorized");
+        return;
+    }
+
+    float voltage    = M5StackChan.getBatteryVoltage();
+    float current_ma = M5StackChan.getBatteryCurrent() * 1000.0f;  // positive = discharging
+
+    char body[1600];
+    snprintf(body, sizeof(body),
+             "{\"sketch\":\"%s\",\"version\":\"%s\",\"uptime_s\":%lu,"
+             "\"battery_v\":%.2f,\"battery_ma\":%.1f,\"wifi_rssi_dbm\":%d,"
+             "\"free_heap\":%u,\"servo_power\":false,\"speaker_volume\":%u,"
+             "\"clips_spoken\":%lu,\"moves_done\":%lu,\"angles_known\":%s,"
+             "\"last_yaw\":%d,\"last_pitch\":%d,\"servo_zero_ok\":%s,\"free_psram\":%u,"
+             "\"photos_taken\":%lu,\"camera_errors\":%lu,\"bus_failed\":%s,\"internal_bus_ok\":%s,"
+             "\"recordings_made\":%lu,\"mic_errors\":%lu,\"quiet\":%s,\"taps_ignored\":%lu,"
+             "\"camera_view\":%s,\"camera_view_mode\":\"%s\",\"camera_view_left_s\":%lu,"
+             "\"views_started\":%lu,\"view_frames\":%lu,\"view_end\":\"%s\",\"screen_ok\":%s,"
+             "\"touch_ok\":%s,\"touch_recals\":%lu,"
+             "\"voice_seq\":%lu,\"voice_ready\":%s,\"voices_sent\":%lu,\"voices_failed\":%lu,"
+             "\"voices_taken\":%lu,\"voices_expired\":%lu,\"voices_silent\":%lu,\"voice_last\":\"%s\","
+             "\"last_hook_code\":%d,\"hook_ok\":%s,\"hook_ip_known\":%s,\"clock_ok\":%s,"
+             "\"requests_served\":%lu}",
+             SKETCH_NAME, SKETCH_VERSION, (unsigned long)(millis() / 1000), voltage, current_ma,
+             (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap(), SPEAKER_VOLUME,
+             (unsigned long)clips_spoken, (unsigned long)moves_done, angles_known ? "true" : "false",
+             last_yaw, last_pitch, zero_ok ? "true" : "false", (unsigned)ESP.getFreePsram(),
+             (unsigned long)photos_taken, (unsigned long)camera_errors, bus_failed ? "true" : "false",
+             internal_bus_ok() ? "true" : "false", (unsigned long)recordings_made, (unsigned long)mic_errors,
+             quiet ? "true" : "false", (unsigned long)taps_ignored,
+             cam_view ? "true" : "false", CAM_VIEW_STREAM ? "stream" : "slow", view_left_s(),
+             (unsigned long)views_started, (unsigned long)view_frames, view_end_reason,
+             screen_ok ? "true" : "false", touch_chip_ok() ? "true" : "false", (unsigned long)touch_recals,
+             (unsigned long)voice_seq, voice_ready ? "true" : "false", (unsigned long)voices_sent,
+             (unsigned long)voices_failed, (unsigned long)voices_taken, (unsigned long)voices_expired,
+             (unsigned long)voices_silent, voice_last, last_hook_code, hook_ok ? "true" : "false",
+             hook_ip_known() ? "true" : "false", clock_ok() ? "true" : "false",
+             (unsigned long)(requests_served + 1));
+
+    requests_served++;
+    server.send(200, "application/json", body);
+}
+
+/* Upload callback: runs per chunk before handle_say_done */
+static void handle_say_upload()
+{
+    HTTPUpload& up = server.upload();
+
+    if (up.status == UPLOAD_FILE_START) {
+        wav_len = 0;
+        if (!is_authorized()) {
+            say_state = SayState::Unauthorized;
+        } else if (!wav_buf) {
+            say_state = SayState::NoBuffer;
+        } else if (M5.Speaker.isPlaying()) {
+            say_state = SayState::Busy;
+        } else if (has_played && millis() - last_play_ms < COOLDOWN_MS) {
+            say_state = SayState::Cooldown;
+        } else {
+            say_state = SayState::Accepting;
+        }
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (say_state != SayState::Accepting) {
+            return;
+        }
+        if (wav_len + up.currentSize > MAX_WAV_BYTES) {
+            say_state = SayState::TooLarge;
+            return;
+        }
+        memcpy(wav_buf + wav_len, up.buf, up.currentSize);
+        wav_len += up.currentSize;
+    } else if (up.status == UPLOAD_FILE_ABORTED) {
+        say_state = SayState::Aborted;
+    }
+}
+
+static void handle_say_done()
+{
+    SayState state = say_state;
+    say_state      = SayState::None;
+
+    switch (state) {
+        case SayState::None:
+            /* No file part arrived: still check auth first so probes learn nothing */
+            if (!is_authorized()) {
+                requests_rejected++;
+                send_json_error(401, "unauthorized");
+            } else {
+                send_json_error(400, "expected one multipart file");
+            }
+            return;
+        case SayState::Unauthorized:
+            requests_rejected++;
+            send_json_error(401, "unauthorized");
+            return;
+        case SayState::NoBuffer:
+            send_json_error(503, "no audio buffer (PSRAM?)");
+            return;
+        case SayState::Busy:
+            send_json_error(409, "already playing");
+            return;
+        case SayState::Cooldown:
+            send_json_error(429, "cooldown");
+            return;
+        case SayState::TooLarge:
+            send_json_error(413, "file too large");
+            return;
+        case SayState::Aborted:
+            send_json_error(400, "upload aborted");
+            return;
+        case SayState::Accepting:
+            break;
+    }
+    if (refused_quiet()) {
+        return;
+    }
+
+    const char* problem = validate_wav(wav_buf, wav_len);
+    if (problem) {
+        send_json_error(400, problem);
+        return;
+    }
+
+    if (!M5.Speaker.playWav(wav_buf, wav_len, 1, -1, true)) {
+        send_json_error(500, "playWav refused the file");
+        return;
+    }
+
+    last_play_ms = millis();
+    has_played   = true;
+    clips_spoken++;
+    requests_served++;
+
+    char body[128];
+    snprintf(body, sizeof(body), "{\"played\":true,\"bytes\":%u,\"clips_spoken\":%lu}", (unsigned)wav_len,
+             (unsigned long)clips_spoken);
+    server.send(200, "application/json", body);
+}
+
+/* Power the servos just long enough to read where the head is; commands no movement */
+static void handle_head_read()
+{
+    if (!is_authorized()) {
+        requests_rejected++;
+        send_json_error(401, "unauthorized");
+        return;
+    }
+
+    if (bus_failed) {
+        send_json_error(503, "movement disabled until restart (internal bus check failed)");
+        return;
+    }
+    if (!zero_ok) {
+        send_json_error(503, "servo calibration (zero positions) missing");
+        return;
+    }
+
+    servo_power_on();
+    if (!servos_ready()) {
+        servo_power_off();
+        send_not_ready();
+        return;
+    }
+    int yaw, pitch;
+    bool read_ok = read_angles(yaw, pitch);
+    servo_power_off();
+    if (!read_ok) {
+        send_json_error(503, "servo position read failed; power off");
+        return;
+    }
+
+    requests_served++;
+    char body[160];
+    snprintf(body, sizeof(body), "{\"yaw\":%d,\"pitch\":%d,\"units\":\"0.1deg\",\"moved\":false,\"ready_ms\":%lu}", yaw, pitch,
+             (unsigned long)ready_waited_ms);
+    server.send(200, "application/json", body);
+}
+
+/* ---------- one move, used by /head/move ---------- */
+
+/* MoveFail and MoveOutcome live in move_outcome.h (Arduino generates prototypes above sketch types) */
+
+/*
+ * Powers the servos, reads the start angles, checks the move against move_rules, makes
+ * ONE move and powers off. With relative=true, yaw/pitch are offsets from the start angles
+ * (no caller since v0.11.0). Callers check cooldown, range, bus and calibration first.
+ */
+static void run_move(int yaw, int pitch, bool relative, MoveOutcome& o)
+{
+    float baseline_ma = M5StackChan.getBatteryCurrent() * 1000.0f;
+
+    servo_power_on();
+    if (!servos_ready()) {
+        servo_power_off();
+        o.fail = MoveFail::NotReady;
+        return;
+    }
+
+    if (!read_angles(o.start_yaw, o.start_pitch)) {
+        servo_power_off();
+        o.fail = MoveFail::ReadFailed;
+        return;
+    }
+    if (relative) {
+        yaw   += o.start_yaw;
+        pitch += o.start_pitch;
+    }
+    o.target_yaw   = yaw;
+    o.target_pitch = pitch;
+
+    o.problem = move_rules::check_move(o.start_yaw, o.start_pitch, yaw, pitch);
+    if (o.problem) {
+        servo_power_off();
+        o.fail = MoveFail::Rejected;
+        return;
+    }
+
+    /* Travel time from the larger axis change, in whole degrees */
+    int step_deg = max(abs(yaw - o.start_yaw), abs(pitch - o.start_pitch)) / 10;
+    o.move_ms    = max(MOVE_MIN_MS, (uint32_t)step_deg * MOVE_MS_PER_DEG);
+
+    uint32_t t0         = millis();
+    uint32_t over_since = 0;
+
+    /* One command per servo: target position plus travel time; speed 0 lets time govern */
+    if (!bus.WritePos(YAW_ID, angle_to_raw(yaw_zero, yaw), o.move_ms, 0) ||
+        !bus.WritePos(PITCH_ID, angle_to_raw(pitch_zero, pitch), o.move_ms, 0)) {
+        o.cmd_failed = true;
+    }
+    delay(40);  // let the servos raise their "moving" flag
+
+    while (!o.cmd_failed && !servos_arrived()) {
+        float delta = M5StackChan.getBatteryCurrent() * 1000.0f - baseline_ma;
+        if (delta > o.peak_delta_ma) {
+            o.peak_delta_ma = delta;
+        }
+        if (delta > STALL_DELTA_MA) {
+            if (over_since == 0) {
+                over_since = millis();
+            } else if (millis() - over_since > STALL_HOLD_MS) {
+                o.stall_abort = true;
+                break;
+            }
+        } else {
+            over_since = 0;
+        }
+        if (millis() - t0 > MOVE_TIMEOUT_MS) {
+            o.timed_out = true;
+            break;
+        }
+        delay(20);
+    }
+
+    o.ok       = !o.timed_out && !o.stall_abort && !o.cmd_failed;
+    o.duration = millis() - t0;
+    if (o.ok) {
+        delay(MOVE_HOLD_MS);
+        o.end_known = read_angles(o.end_yaw, o.end_pitch);
+    } else {
+        /* Abort: cut power right away rather than command anything else */
+        angles_known = false;
+    }
+    servo_power_off();
+
+    last_move_end_ms = millis();
+    has_moved        = true;
+    if (o.ok) {
+        moves_done++;
+    }
+}
+
+static void handle_head_move()
+{
+    if (!is_authorized()) {
+        requests_rejected++;
+        send_json_error(401, "unauthorized");
+        return;
+    }
+
+    int yaw, pitch;
+    if (!server.hasArg("yaw") || !server.hasArg("pitch") ||
+        !move_rules::parse_angle(server.arg("yaw").c_str(), yaw) ||
+        !move_rules::parse_angle(server.arg("pitch").c_str(), pitch)) {
+        send_json_error(400, "need integer yaw and pitch (tenths of a degree)");
+        return;
+    }
+    if (refused_quiet()) {
+        return;
+    }
+    if (M5.Speaker.isPlaying()) {
+        send_json_error(409, "busy: audio playing");
+        return;
+    }
+    if (has_moved && millis() - last_move_end_ms < MOVE_COOLDOWN_MS) {
+        send_json_error(429, "cooldown");
+        return;
+    }
+
+    /* Range check before powering anything; step check needs the real start angles */
+    const char* problem = move_rules::check_move(yaw, pitch, yaw, pitch);
+    if (problem) {
+        send_json_error(400, problem);
+        return;
+    }
+
+    if (bus_failed) {
+        send_json_error(503, "movement disabled until restart (internal bus check failed)");
+        return;
+    }
+    if (!zero_ok) {
+        send_json_error(503, "servo calibration (zero positions) missing");
+        return;
+    }
+
+    MoveOutcome o;
+    run_move(yaw, pitch, false, o);
+
+    switch (o.fail) {
+        case MoveFail::NotReady:
+            send_not_ready();
+            return;
+        case MoveFail::ReadFailed:
+            send_json_error(503, "servo position read failed; power off");
+            return;
+        case MoveFail::Rejected: {
+            char body[200];
+            snprintf(body, sizeof(body), "{\"error\":\"%s\",\"start_yaw\":%d,\"start_pitch\":%d}", o.problem,
+                     o.start_yaw, o.start_pitch);
+            server.send(400, "application/json", body);
+            return;
+        }
+        case MoveFail::None:
+            break;
+    }
+    if (o.ok) {
+        requests_served++;
+    }
+
+    char end_buf[48];
+    if (o.end_known) {
+        snprintf(end_buf, sizeof(end_buf), "\"end_yaw\":%d,\"end_pitch\":%d", o.end_yaw, o.end_pitch);
+    } else {
+        snprintf(end_buf, sizeof(end_buf), "\"end_yaw\":null,\"end_pitch\":null");
+    }
+
+    char body[420];
+    snprintf(body, sizeof(body),
+             "{\"moved\":%s,\"target_yaw\":%d,\"target_pitch\":%d,\"start_yaw\":%d,\"start_pitch\":%d,"
+             "%s,\"move_ms\":%lu,\"duration_ms\":%lu,\"peak_current_delta_ma\":%.0f,"
+             "\"timed_out\":%s,\"stall_abort\":%s,\"cmd_failed\":%s,\"servo_power\":false,\"moves_done\":%lu}",
+             o.ok ? "true" : "false", yaw, pitch, o.start_yaw, o.start_pitch, end_buf, (unsigned long)o.move_ms,
+             (unsigned long)o.duration, o.peak_delta_ma, o.timed_out ? "true" : "false",
+             o.stall_abort ? "true" : "false", o.cmd_failed ? "true" : "false", (unsigned long)moves_done);
+    server.send(o.ok ? 200 : 500, "application/json", body);
+}
+
+static void handle_snap()
+{
+    if (!is_authorized()) {
+        requests_rejected++;
+        send_json_error(401, "unauthorized");
+        return;
+    }
+    if (bus_failed) {
+        send_json_error(503, "camera disabled until restart (internal bus check failed)");
+        return;
+    }
+    if (refused_quiet()) {
+        return;
+    }
+    if (has_snapped && millis() - last_snap_ms < SNAP_COOLDOWN_MS) {
+        send_json_error(429, "cooldown");
+        return;
+    }
+    if (M5.Speaker.isPlaying()) {
+        send_json_error(409, "busy: audio playing");
+        return;
+    }
+
+    show_banner(TFT_RED, "CAMERA");
+
+    uint32_t t0     = millis();
+    size_t len      = 0;
+    const char* why = nullptr;
+    uint8_t* jpg    = capture_jpeg(&len, &why);
+    uint32_t took   = millis() - t0;
+
+    clear_banner();
+    last_snap_ms = millis();
+    has_snapped  = true;
+    if (bus_failed) {
+        view_stop("bus fault");
+    }
+    last_draw_ms = millis();
+    draw_screen();
+
+    if (!jpg) {
+        camera_errors++;
+        send_json_error(500, why ? why : "capture failed");
+        return;
+    }
+
+    photos_taken++;
+    requests_served++;
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("X-Capture-Ms", String(took));
+    /* On ESP32 "PROGMEM" is ordinary memory; this overload sends binary data with a length */
+    server.send_P(200, "image/jpeg", (const char*)jpg, len);
+    free(jpg);
+}
+
+/* ---------- microphone ---------- */
+
+static void wr16le(uint8_t* p, uint16_t v)
+{
+    p[0] = v & 0xFF;
+    p[1] = v >> 8;
+}
+
+static void wr32le(uint8_t* p, uint32_t v)
+{
+    for (int i = 0; i < 4; i++) {
+        p[i] = (v >> (8 * i)) & 0xFF;
+    }
+}
+
+static void write_wav_header(uint8_t* h, uint32_t data_bytes)
+{
+    memcpy(h, "RIFF", 4);
+    wr32le(h + 4, 36 + data_bytes);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    wr32le(h + 16, 16);           // fmt chunk size
+    wr16le(h + 20, 1);            // PCM
+    wr16le(h + 22, 1);            // mono
+    wr32le(h + 24, MIC_RATE);
+    wr32le(h + 28, MIC_RATE * 2); // byte rate
+    wr16le(h + 32, 2);            // block align
+    wr16le(h + 34, 16);           // bits per sample
+    memcpy(h + 36, "data", 4);
+    wr32le(h + 40, data_bytes);
+}
+
+static void draw_mic_banner(int secs_left)
+{
+    show_banner(TFT_RED, "MIC REC  %d s", secs_left);
+}
+
+static void handle_mic_record()
+{
+    if (!is_authorized()) {
+        requests_rejected++;
+        send_json_error(401, "unauthorized");
+        return;
+    }
+    if (bus_failed) {
+        send_json_error(503, "microphone disabled until restart (internal bus check failed)");
+        return;
+    }
+    if (!rec_buf) {
+        send_json_error(503, "no recording buffer (PSRAM?)");
+        return;
+    }
+
+    /* secs: one or two digits, 1..MIC_MAX_SECS */
+    String arg = server.hasArg("secs") ? server.arg("secs") : String("5");
+    int secs   = 0;
+    if (arg.length() < 1 || arg.length() > 2) {
+        secs = -1;
+    }
+    for (size_t i = 0; secs >= 0 && i < arg.length(); i++) {
+        secs = isdigit((unsigned char)arg[i]) ? secs * 10 + (arg[i] - '0') : -1;
+    }
+    if (secs < 1 || secs > MIC_MAX_SECS) {
+        send_json_error(400, "secs must be 1..8");
+        return;
+    }
+    if (refused_quiet()) {
+        return;
+    }
+    if (has_recorded && millis() - last_rec_ms < REC_COOLDOWN_MS) {
+        send_json_error(429, "cooldown");
+        return;
+    }
+    if (M5.Speaker.isPlaying()) {
+        send_json_error(409, "busy: audio playing");
+        return;
+    }
+
+    uint32_t took   = 0;
+    const char* why = record_samples(secs, took);
+    if (why) {
+        mic_errors++;
+        send_json_error(500, why);
+        return;
+    }
+
+    int16_t* pcm    = rec_buf + MIC_WARMUP;
+    size_t samples  = (size_t)secs * MIC_RATE;
+    int32_t peak    = 0;
+    int rms         = 0;
+    measure_level(pcm, samples, peak, rms);
+
+    /* The warm-up region is discarded; the 44-byte header goes in its last bytes */
+    uint8_t* wav    = (uint8_t*)pcm - WAV_HEADER_BYTES;
+    size_t data_len = samples * 2;
+    write_wav_header(wav, data_len);
+
+    recordings_made++;
+    requests_served++;
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("X-Record-Ms", String(took));
+    server.sendHeader("X-Peak", String(peak));
+    server.sendHeader("X-Rms", String(rms));
+    /* On ESP32 "PROGMEM" is ordinary memory; this overload sends binary data with a length */
+    server.send_P(200, "audio/wav", (const char*)wav, WAV_HEADER_BYTES + data_len);
+}
+
+/* Signal level only, so silence can be detected without listening */
+static void measure_level(const int16_t* pcm, size_t samples, int32_t& peak, int& rms)
+{
+    peak          = 0;
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < samples; i++) {
+        int32_t v = pcm[i] < 0 ? -(int32_t)pcm[i] : pcm[i];
+        if (v > peak) {
+            peak = v;
+        }
+        sum_sq += (double)pcm[i] * pcm[i];
+    }
+    rms = (int)sqrt(sum_sq / samples);
+}
+
+/* One recording of secs seconds into rec_buf (after MIC_WARMUP), with banner, beep, speaker
+ * hand-over and bus check; starts the recording cooldown. Returns nullptr or the reason. */
+static const char* record_samples(int secs, uint32_t& took)
+{
+    draw_mic_banner(secs);  // stays up (over the status or the last camera frame) until cleared
+
+    /* Audible cue while the speaker still owns the shared pins */
+    M5.Speaker.tone(CUE_HZ, CUE_MS);
+    uint32_t c0 = millis();
+    while (M5.Speaker.isPlaying() && millis() - c0 < CUE_MS + 300) {
+        delay(5);
+    }
+    M5.Speaker.end();
+
+    const char* why = nullptr;
+    size_t samples  = (size_t)secs * MIC_RATE;
+    uint32_t t0     = millis();
+    if (!M5.Mic.begin()) {
+        why = "mic begin failed";
+    } else if (!M5.Mic.record(rec_buf, MIC_WARMUP + samples, MIC_RATE)) {
+        why = "mic record refused";
+    } else {
+        int shown      = secs;
+        uint32_t limit = (uint32_t)secs * 1000 + 2000;
+        while (M5.Mic.isRecording() && millis() - t0 < limit) {
+            int left = secs - (int)((millis() - t0) / 1000);
+            if (left != shown && left >= 0) {
+                shown = left;
+                draw_mic_banner(left);
+            }
+            delay(10);
+        }
+        if (M5.Mic.isRecording()) {
+            why = "recording timed out";
+        }
+    }
+    M5.Mic.end();  // resets the codec and powers its inputs down
+    took = millis() - t0;
+
+    M5.Speaker.begin();
+    M5.Speaker.setVolume(SPEAKER_VOLUME);
+
+    if (!internal_bus_ok()) {
+        bus_failed = true;
+        why        = BUS_LOST;
+        view_stop("bus fault");
+    }
+
+    clear_banner();
+    last_rec_ms  = millis();
+    has_recorded = true;
+    last_draw_ms = millis();
+    draw_screen();
+    return why;
+}
+
+/* ---------- touch-to-talk signal (R6a) ---------- */
+
+/* True (and a 423 already sent) when QUIET mode refuses the request */
+static bool refused_quiet()
+{
+    if (!quiet) {
+        return false;
+    }
+    send_json_error(423, "quiet mode (hold the robot's screen to toggle)");
+    return true;
+}
+
+/* ---------- hold-to-talk (R7b) ---------- */
+
+static bool clock_ok()
+{
+    return time(nullptr) > CLOCK_VALID_AFTER;
+}
+
+static bool hook_ip_known()
+{
+    return hook_ip != IPAddress((uint32_t)0);
+}
+
+/* Zero the clip so nothing of it stays in memory */
+static void wipe_voice(const char* outcome)
+{
+    if (voice_buf) {
+        memset(voice_buf, 0, VOICE_WAV_BYTES);
+    }
+    voice_ready = false;
+    voice_last  = outcome;
+}
+
+/* Short maroon notice, cleared by voice_tick() */
+static void show_notice(const char* reason)
+{
+    show_banner(TFT_MAROON, "TALK: %s", reason);
+    notice_until_ms = millis() + NOTICE_MS;
+    if (notice_until_ms == 0) {
+        notice_until_ms = 1;
+    }
+}
+
+/* "name.local" through mDNS, anything else through DNS */
+static bool resolve_hook_host()
+{
+    String host = HERMES_HOOK_HOST;
+    IPAddress ip((uint32_t)0);
+    if (host.endsWith(".local")) {
+        ip = MDNS.queryHost(host.substring(0, host.length() - 6).c_str(), 2000);
+    } else if (!WiFi.hostByName(host.c_str(), ip)) {
+        ip = IPAddress((uint32_t)0);
+    }
+    hook_ip = ip;
+    return hook_ip_known();
+}
+
+static bool sign_hook(const char* ts, const char* body, char hex[65])
+{
+    String msg = String(ts) + "." + body;
+    uint8_t mac[32];
+    const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!md || mbedtls_md_hmac(md, (const uint8_t*)HERMES_HOOK_SECRET, strlen(HERMES_HOOK_SECRET),
+                               (const uint8_t*)msg.c_str(), msg.length(), mac) != 0) {
+        return false;
+    }
+    for (int i = 0; i < 32; i++) {
+        snprintf(hex + 2 * i, 3, "%02x", mac[i]);
+    }
+    return true;
+}
+
+/* The one request this robot ever starts: {"clip":N} to the gateway. Returns the HTTP code,
+ * or a negative number when nothing was sent (-100 name not found, -101 signing failed). */
+static int send_hook(uint32_t seq)
+{
+    if (!hook_ip_known() && !resolve_hook_host()) {
+        return -100;
+    }
+    char body[32];
+    snprintf(body, sizeof(body), "{\"clip\":%lu}", (unsigned long)seq);
+    char ts[24];
+    snprintf(ts, sizeof(ts), "%lld", (long long)time(nullptr));
+    char sig[65];
+    if (!sign_hook(ts, body, sig)) {
+        return -101;
+    }
+    char rid[40];
+    snprintf(rid, sizeof(rid), "stackchan-%08lx-%lu", (unsigned long)boot_id, (unsigned long)seq);
+
+    HTTPClient http;
+    http.setConnectTimeout(HOOK_TIMEOUT_MS);
+    http.setTimeout(HOOK_TIMEOUT_MS);
+    http.begin(hook_ip.toString(), HOOK_PORT, HOOK_PATH);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Webhook-Timestamp", ts);
+    http.addHeader("X-Webhook-Signature-V2", sig);
+    http.addHeader("X-Request-ID", rid);
+    int code = http.POST((uint8_t*)body, strlen(body));
+    http.end();
+    if (code < 0) {
+        hook_ip = IPAddress((uint32_t)0);  // look the name up again next time (the Mac may have moved)
+    }
+    return code;
+}
+
+/* Head tapped or held: record VOICE_SECS, keep the clip, tell Hermes */
+static void start_voice()
+{
+    if (quiet) {
+        taps_ignored++;
+        return;
+    }
+    const char* no = nullptr;
+    if (!hook_ok) {
+        no = "no hook secret";
+    } else if (bus_failed || !rec_buf || !voice_buf) {
+        no = "mic unavailable";
+    } else if (!clock_ok()) {
+        no = "no clock yet";
+    } else if (voice_ready || thinking || M5.Speaker.isPlaying()) {
+        no = "busy";
+    } else if (has_recorded && millis() - last_rec_ms < REC_COOLDOWN_MS) {
+        no = "wait a moment";
+    }
+    if (no) {
+        show_notice(no);
+        return;
+    }
+    clear_banner();
+    notice_until_ms = 0;
+
+    uint32_t took   = 0;
+    const char* why = record_samples(VOICE_SECS, took);
+    if (why) {
+        mic_errors++;
+        show_notice(why);
+        return;
+    }
+    recordings_made++;
+    const int16_t* pcm = rec_buf + MIC_WARMUP;
+    size_t samples     = (size_t)VOICE_SECS * MIC_RATE;
+    measure_level(pcm, samples, voice_peak, voice_rms);
+    voice_seq++;
+    if (voice_rms < VOICE_MIN_RMS) {
+        memset(rec_buf, 0, (MIC_WARMUP + samples) * sizeof(int16_t));
+        voices_silent++;
+        voice_last = "silent";
+        show_notice("heard nothing");
+        return;
+    }
+    write_wav_header(voice_buf, samples * 2);
+    memcpy(voice_buf + WAV_HEADER_BYTES, pcm, samples * 2);
+    memset(rec_buf, 0, (MIC_WARMUP + samples) * sizeof(int16_t));
+    voice_ready = true;
+    voice_ms    = millis();
+
+    show_banner(TFT_BLUE, "THINKING...");
+    last_hook_code = send_hook(voice_seq);
+    if (last_hook_code == 202 || last_hook_code == 200) {
+        voices_sent++;
+        voice_last     = "sent";
+        thinking       = true;
+        think_start_ms = millis();
+        think_mark     = clips_spoken + moves_done + views_started;
+    } else {
+        voices_failed++;
+        wipe_voice(last_hook_code == -100 ? "mac not found" : "hook failed");
+        show_notice(voice_last);
+    }
+}
+
+/* Called from loop(): clip expiry, end of THINKING, notices */
+static void voice_tick()
+{
+    if (voice_ready && millis() - voice_ms > VOICE_KEEP_MS) {
+        voices_expired++;
+        wipe_voice("expired");
+    }
+    if (thinking && (clips_spoken + moves_done + views_started != think_mark ||
+                     millis() - think_start_ms > THINK_MAX_MS)) {
+        thinking = false;
+        if (banner_on && banner_bg == TFT_BLUE) {
+            clear_banner();
+            last_draw_ms = millis();
+            draw_screen();
+        }
+    }
+    if (notice_until_ms && (int32_t)(millis() - notice_until_ms) >= 0) {
+        notice_until_ms = 0;
+        if (banner_on && banner_bg == TFT_MAROON) {
+            clear_banner();
+            last_draw_ms = millis();
+            draw_screen();
+        }
+    }
+}
+
+static void handle_voice_take()
+{
+    if (!is_authorized()) {
+        requests_rejected++;
+        send_json_error(401, "unauthorized");
+        return;
+    }
+    String arg  = server.hasArg("clip") ? server.arg("clip") : String("");
+    bool digits = arg.length() >= 1 && arg.length() <= 9;
+    for (size_t i = 0; digits && i < arg.length(); i++) {
+        digits = isdigit((unsigned char)arg[i]);
+    }
+    if (!digits) {
+        send_json_error(400, "need clip");
+        return;
+    }
+    if (!voice_ready || (uint32_t)arg.toInt() != voice_seq) {
+        send_json_error(404, "no such clip (taken, expired, or never made)");
+        return;
+    }
+    voices_taken++;
+    requests_served++;
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("X-Peak", String(voice_peak));
+    server.sendHeader("X-Rms", String(voice_rms));
+    server.send_P(200, "audio/wav", (const char*)voice_buf, VOICE_WAV_BYTES);
+    wipe_voice("taken");
+}
+
+/* Called from loop(): head taps and holds (talk) and the QUIET toggle */
+static void check_touch()
+{
+    if (M5.Touch.getDetail().wasHold()) {
+        quiet = !quiet;
+        if (quiet) {
+            view_stop("quiet");
+            if (voice_ready) {
+                wipe_voice("quiet");
+            }
+            thinking = false;
+        }
+        last_draw_ms = millis();
+        draw_screen();
+    }
+
+    if (M5StackChan.TouchSensor.wasHold() || M5StackChan.TouchSensor.wasClicked()) {
+        start_voice();
+    }
+}
+
+static void handle_not_found()
+{
+    send_json_error(404, "not found");
+}
+
+/* ---------- screen (R7a): layers composed in screen_spr, then one push ---------- */
+
+static unsigned long view_left_s()
+{
+    if (!cam_view) {
+        return 0;
+    }
+    uint32_t on_ms = millis() - cam_view_start_ms;
+    return on_ms >= CAM_VIEW_MAX_MS ? 0 : (CAM_VIEW_MAX_MS - on_ms + 999) / 1000;
+}
+
+/* Banner on top of whatever layer is showing; stays until clear_banner() */
+static void show_banner(uint16_t bg, const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(banner_text, sizeof(banner_text), fmt, ap);
+    va_end(ap);
+    banner_bg = bg;
+    banner_on = true;
+    compose_screen();
+}
+
+static void clear_banner()
+{
+    banner_on = false;
+}
+
+static void draw_banner(LovyanGFX& g)
+{
+    g.fillRect(0, 0, g.width(), 40, banner_bg);
+    g.setTextColor(TFT_WHITE, banner_bg);
+    g.setCursor(8, 12);
+    g.print(banner_text);
+}
+
+/* Red frame and countdown, so a live camera is obvious to anyone looking at the robot */
+static void draw_live_frame(LovyanGFX& g)
+{
+    for (int i = 0; i < LIVE_BORDER; i++) {
+        g.drawRect(i, i, g.width() - 2 * i, g.height() - 2 * i, TFT_RED);
+    }
+    unsigned long left = view_left_s();
+    int y              = g.height() - LIVE_BORDER - 24;
+    g.fillRect(LIVE_BORDER, y, 116, 24, TFT_RED);
+    g.setTextColor(TFT_WHITE, TFT_RED);
+    g.setCursor(LIVE_BORDER + 6, y + 4);
+    g.printf("LIVE %lu:%02lu", left / 60, left % 60);
+}
+
+static void compose_screen()
+{
+    auto& d = M5StackChan.Display();
+    if (!screen_ok) {
+        /* No canvases: draw straight to the display as R6 did (camera view is refused) */
+        render_status(d);
+        if (banner_on) {
+            draw_banner(d);
+        }
+        return;
+    }
+    if (cam_view) {
+        cam_spr.pushSprite(&screen_spr, 0, 0);
+        draw_live_frame(screen_spr);
+    } else {
+        status_spr.pushSprite(&screen_spr, 0, 0);
+    }
+    if (banner_on) {
+        draw_banner(screen_spr);
+    }
+    screen_spr.pushSprite(&d, 0, 0);
+}
+
+/* Redraw the status layer and show the screen */
+static void draw_screen()
+{
+    if (screen_ok) {
+        render_status(status_spr);
+    }
+    compose_screen();
+}
+
+static void render_status(LovyanGFX& d)
+{
+    d.fillScreen(TFT_BLACK);
+    d.setCursor(0, 0);
+    if (quiet) {
+        d.fillRect(0, 0, d.width(), 32, TFT_DARKGREY);
+        d.setTextColor(TFT_WHITE, TFT_DARKGREY);
+        d.setCursor(8, 8);
+        d.printf("QUIET (hold to resume)");
+        d.setCursor(0, 36);
+    }
+    d.setTextColor(TFT_GREENYELLOW, TFT_BLACK);
+    d.printf("%s v%s\n", SKETCH_NAME, SKETCH_VERSION);
+    d.setTextColor(TFT_WHITE, TFT_BLACK);
+
+    if (WiFi.status() == WL_CONNECTED) {
+        d.printf("IP %s:%u\n", WiFi.localIP().toString().c_str(), HTTP_PORT);
+    } else {
+        d.printf("Wi-Fi connecting...\n");
+    }
+
+    d.printf("Bat %.2fV %.0fmA\n", M5StackChan.getBatteryVoltage(), M5StackChan.getBatteryCurrent() * 1000.0f);
+    d.printf("served   %lu\nrejected %lu\nspoken   %lu\nmoves    %lu\nphotos   %lu\nheard    %lu\n",
+             (unsigned long)requests_served, (unsigned long)requests_rejected, (unsigned long)clips_spoken,
+             (unsigned long)moves_done, (unsigned long)photos_taken, (unsigned long)recordings_made);
+    if (angles_known) {
+        d.printf("head %d,%d\n", last_yaw, last_pitch);
+    }
+    d.printf("views %lu  touch %s\n", (unsigned long)views_started, touch_chip_ok() ? "ok" : "NO");
+    d.printf("talk %lu  clock %s\n", (unsigned long)voices_sent, clock_ok() ? "ok" : "NO");
+
+    if (!token_ok) {
+        d.setTextColor(TFT_RED);
+        d.printf("TOKEN NOT SET (secrets.h)\n");
+    }
+    if (!wav_buf) {
+        d.setTextColor(TFT_RED);
+        d.printf("NO AUDIO BUFFER\n");
+    }
+    if (!rec_buf) {
+        d.setTextColor(TFT_RED);
+        d.printf("NO MIC BUFFER\n");
+    }
+    if (!zero_ok) {
+        d.setTextColor(TFT_RED);
+        d.printf("NO SERVO CALIBRATION\n");
+    }
+    if (bus_failed) {
+        d.setTextColor(TFT_RED);
+        d.printf("BUS FAULT - restart\n");
+    }
+    if (!screen_ok) {
+        d.setTextColor(TFT_RED);
+        d.printf("NO SCREEN BUFFERS\n");
+    }
+    if (!hook_ok) {
+        d.setTextColor(TFT_RED);
+        d.printf("TALK OFF (secrets.h)\n");
+    }
+}
+
+void setup()
+{
+    Serial.begin(115200);
+
+    /* Init StackChan (reads servo positions, torque off), then cut servo power */
+    M5StackChan.begin();
+    M5StackChan.setServoPowerEnabled(false);
+
+    /* Keep the library's motion task off the servo bus; this sketch drives the servos */
+    M5StackChan.Motion.setAutoTorqueReleaseEnabled(false);
+    bus.attach(SERVO_UART);
+    load_servo_zeros();
+
+    M5.Speaker.begin();
+    M5.Speaker.setVolume(SPEAKER_VOLUME);
+
+    /* Microphone: 16 kHz mono; begun only while recording (shares pins with the speaker) */
+    auto mic_cfg        = M5.Mic.config();
+    mic_cfg.sample_rate = MIC_RATE;
+    mic_cfg.stereo      = false;
+    M5.Mic.config(mic_cfg);
+    rec_buf = (int16_t*)heap_caps_malloc((MIC_WARMUP + (size_t)MIC_MAX_SECS * MIC_RATE) * sizeof(int16_t),
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    voice_buf = (uint8_t*)heap_caps_calloc(1, VOICE_WAV_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    /* Head touch: a touch held HOLD_MS reports one hold and no click; shorter ones are clicks */
+    M5StackChan.TouchSensor.setHoldThresh(HOLD_MS);
+
+    /* Three full-screen 16-bit layers in PSRAM (about 150 KB each) */
+    auto& d = M5StackChan.Display();
+    d.setTextSize(2);
+    screen_ok = true;
+    for (M5Canvas* c : {&status_spr, &cam_spr, &screen_spr}) {
+        c->setPsram(true);
+        c->setColorDepth(16);
+        screen_ok = screen_ok && c->createSprite(d.width(), d.height()) != nullptr;
+        c->setTextSize(2);
+    }
+
+    token_ok = strlen(HERMES_STATUS_TOKEN) >= MIN_TOKEN_LEN &&
+               strcmp(HERMES_STATUS_TOKEN, "REPLACE_WITH_A_LONG_RANDOM_TOKEN") != 0;
+
+    hook_ok = strlen(HERMES_HOOK_SECRET) >= MIN_HOOK_SECRET && strlen(HERMES_HOOK_HOST) > 0 &&
+              strcmp(HERMES_HOOK_SECRET, "REPLACE_WITH_THE_GATEWAY_ROUTE_SECRET") != 0;
+    boot_id = esp_random();
+
+    wav_buf = (uint8_t*)heap_caps_malloc(MAX_WAV_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+        delay(250);
+    }
+
+    /* R7b: UTC from NTP for webhook timestamps (set in the background); mDNS to find the Mac */
+    configTime(0, 0, "pool.ntp.org", "time.apple.com");
+    MDNS.begin("stackchan");
+    if (hook_ok && WiFi.status() == WL_CONNECTED) {
+        resolve_hook_host();
+    }
+
+    /* Only the Authorization header is needed; WebServer discards others */
+    const char* header_keys[] = {"Authorization"};
+    server.collectHeaders(header_keys, 1);
+    server.on("/status", HTTP_GET, handle_status);
+    server.on("/say", HTTP_POST, handle_say_done, handle_say_upload);
+    server.on("/head/read", HTTP_POST, handle_head_read);
+    server.on("/head/move", HTTP_POST, handle_head_move);
+    server.on("/camera/snap", HTTP_POST, handle_snap);
+    server.on("/camera/view", HTTP_POST, handle_camera_view);
+    server.on("/mic/record", HTTP_POST, handle_mic_record);
+    server.on("/voice/take", HTTP_POST, handle_voice_take);
+    server.onNotFound(handle_not_found);
+    server.begin();
+
+    /* Never print the token or Wi-Fi password */
+    /* Head-touch baseline after start-up power switching (R6c saw one boot with no taps) */
+    if (touch_chip_ok()) {
+        touch_recalibrate();
+    }
+
+    Serial.printf("[R7] %s ready, ip=%s port=%u token_ok=%d wav_buf=%d screen_ok=%d touch_ok=%d hook_ok=%d mac=%s\n",
+                  SKETCH_NAME, WiFi.localIP().toString().c_str(), HTTP_PORT, token_ok, wav_buf != nullptr, screen_ok,
+                  touch_ok, hook_ok, hook_ip.toString().c_str());
+    draw_screen();
+}
+
+void loop()
+{
+    M5StackChan.update();
+    check_touch();
+    server.handleClient();
+    view_tick();
+    voice_tick();
+
+    if (millis() - last_draw_ms > 2000) {
+        last_draw_ms = millis();
+        draw_screen();
+    }
+    delay(2);
+}
