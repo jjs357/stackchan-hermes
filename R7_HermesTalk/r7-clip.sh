@@ -1,5 +1,5 @@
 #!/bin/bash
-# r7-clip.sh — take ONE hold-to-talk clip from the StackChan (R7 sketch v0.10.0), transcribe it
+# r7-clip.sh — take ONE talk clip from the StackChan (R7 sketch v0.12.0: 1–8 s), transcribe it
 # LOCALLY with whisper.cpp, and print only the text. Used by the hear_clip tool (R7b).
 #
 # Usage:
@@ -16,8 +16,8 @@ conf="$here/r7.conf"
 model="$here/../R5_HermesListen/models/ggml-base.en.bin"
 model_sha256="a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
 hint="Stack Chan, StackChan robot."
-voice_secs=5
-wav_bytes=$(( 44 + voice_secs * 16000 * 2 ))
+min_bytes=$(( 44 + 1 * 16000 * 2 ))  # the robot ends a clip when speech stops: 1..8 s
+max_bytes=$(( 44 + 8 * 16000 * 2 ))
 
 clip="${1:-}"
 [[ $# -eq 1 && "$clip" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "usage: $0 <clip 1..999999999>" >&2; exit 2; }
@@ -67,12 +67,14 @@ if [[ "$code" != "200" ]]; then
     exit 1
 fi
 size="$(wc -c < "$audio" | tr -d ' ')"
-if [[ "$ctype" != "audio/wav" || "$size" -ne "$wav_bytes" ]]; then
-    echo "error: unexpected reply (type '$ctype', $size bytes, expected $wav_bytes); discarded" >&2
+if [[ "$ctype" != "audio/wav" ]] || (( size < min_bytes || size > max_bytes || size % 2 )); then
+    echo "error: unexpected reply (type '$ctype', $size bytes, expected $min_bytes..$max_bytes); discarded" >&2
     exit 1
 fi
+le32() { od -An -tu4 -j "$1" -N4 "$audio" | tr -d ' '; }
 if [[ "$(head -c 4 "$audio")" != "RIFF" || "$(dd if="$audio" bs=1 skip=8 count=8 2>/dev/null)" != "WAVEfmt " ||
-      "$(dd if="$audio" bs=1 skip=36 count=4 2>/dev/null)" != "data" ]]; then
+      "$(dd if="$audio" bs=1 skip=36 count=4 2>/dev/null)" != "data" ||
+      "$(le32 4)" != "$(( size - 8 ))" || "$(le32 24)" != "16000" || "$(le32 40)" != "$(( size - 44 ))" ]]; then
     echo "error: reply is not the expected WAV layout; discarded" >&2
     exit 1
 fi
@@ -87,6 +89,7 @@ secs_taken=$(( $(date +%s) - start ))
 text="$(sed 's/^[[:space:]]*//' "$tmpdir/transcript.txt" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
 [[ -n "$text" ]] || text="(no speech recognised)"
 
-echo "clip $clip: ${voice_secs} s (peak $(hdr x-peak), rms $(hdr x-rms) of 32767), deleted after transcription"
+clip_ms=$(( (size - 44) * 1000 / 32000 ))
+echo "clip $clip: $(( clip_ms / 1000 )).$(( clip_ms % 1000 / 100 )) s (peak $(hdr x-peak), rms $(hdr x-rms) of 32767), deleted after transcription"
 echo "transcript by whisper.cpp base.en (local, ${secs_taken} s):"
 echo "$text"

@@ -3,6 +3,17 @@
  * plus a sprite-based screen, a camera view on the robot's own screen (R7a) and
  * hold-to-talk with Hermes (R7b).
  *
+ * v0.12.0, changes from v0.11.0:
+ *   - Talk stops recording when the person stops speaking: the clip is recorded in 100 ms
+ *     pieces (VOICE_CHUNK) and ends after VOICE_END_QUIET_CHUNKS quiet pieces (0.8 s) that
+ *     follow speech, at the earliest after VOICE_MIN_CHUNKS (1 s). No speech within
+ *     VOICE_NO_SPEECH_CHUNKS (3 s) = "heard nothing", nothing sent. At most VOICE_MAX_SECS
+ *     (8 s, was a fixed 5 s). A piece counts as speech at rms >= VOICE_SPEECH_RMS.
+ *   - Clips are variable length; /voice/take returns just the recorded part
+ *   - /status: voice_len_ms, voice_end (quiet / max / no speech), voice_loud_rms (loudest
+ *     piece; signal level only, for tuning VOICE_SPEECH_RMS)
+ *   - /mic/record is unchanged (fixed length)
+ *
  * v0.11.0, changes from v0.10.0:
  *   - A tap on the head now starts talk exactly like a hold (beep, record, webhook); the
  *     look-up tap gesture, the Mac tap flag and GET /events + POST /events/ack are removed,
@@ -147,7 +158,7 @@
 extern "C" int SCCB_Deinit(void);
 
 static const char* SKETCH_NAME      = "R7_HermesTalk";
-static const char* SKETCH_VERSION   = "0.11.0";
+static const char* SKETCH_VERSION   = "0.12.0";
 static const uint16_t HTTP_PORT     = 8080;
 static const size_t MIN_TOKEN_LEN   = 16;
 static const size_t MAX_WAV_BYTES   = 192 * 1024;
@@ -247,10 +258,14 @@ static uint32_t taps_ignored    = 0;  // head touches ignored while QUIET
 
 /* Hold-to-talk (R7b) */
 static const uint32_t HOLD_MS          = 1000;   // a hold reports once at 1 s, a tap on release; both talk
-static const int VOICE_SECS            = 5;
-static const size_t VOICE_WAV_BYTES    = WAV_HEADER_BYTES + (size_t)VOICE_SECS * MIC_RATE * 2;
+static const int VOICE_MAX_SECS        = MIC_MAX_SECS;  // 8 s
+static const size_t VOICE_WAV_BYTES    = WAV_HEADER_BYTES + (size_t)VOICE_MAX_SECS * MIC_RATE * 2;
+static const size_t VOICE_CHUNK        = MIC_RATE / 10;  // 100 ms pieces, checked as they arrive
+static const int VOICE_SPEECH_RMS      = 200;    // a piece this loud is speech (room ~17, speech ~1300 average)
+static const size_t VOICE_END_QUIET_CHUNKS = 8;  // 0.8 s quiet after speech ends the clip
+static const size_t VOICE_MIN_CHUNKS   = 10;     // never shorter than 1 s
+static const size_t VOICE_NO_SPEECH_CHUNKS = 30; // no speech in the first 3 s = nothing said
 static const uint32_t VOICE_KEEP_MS    = 60000;  // a clip nobody took is wiped after this
-static const int VOICE_MIN_RMS         = 60;     // quieter than this = nothing said (room ~17, speech ~1300)
 static const uint32_t THINK_MAX_MS     = 45000;
 static const uint32_t NOTICE_MS        = 2500;
 static const uint16_t HOOK_PORT        = 8644;
@@ -259,7 +274,8 @@ static const uint32_t HOOK_TIMEOUT_MS  = 3000;
 static const size_t MIN_HOOK_SECRET    = 32;
 static const time_t CLOCK_VALID_AFTER  = 1700000000;  // NTP has set the clock (Nov 2023)
 
-static uint8_t* voice_buf      = nullptr;  // PSRAM: WAV header + VOICE_SECS of samples
+static uint8_t* voice_buf      = nullptr;  // PSRAM: WAV header + up to VOICE_MAX_SECS of samples
+static size_t voice_bytes      = 0;        // WAV length of the waiting clip
 static bool voice_ready        = false;    // a clip is waiting for /voice/take
 static uint32_t voice_seq      = 0;
 static uint32_t voice_ms       = 0;
@@ -271,6 +287,9 @@ static uint32_t voices_taken   = 0;
 static uint32_t voices_expired = 0;
 static uint32_t voices_silent  = 0;
 static const char* voice_last  = "none";
+static uint32_t voice_len_ms   = 0;        // length of the last talk recording
+static const char* voice_end   = "none";   // why it ended: quiet / max / no speech
+static int voice_loud_rms      = 0;        // loudest 100 ms piece of the last talk recording
 static int last_hook_code      = 0;
 static bool hook_ok            = false;    // secret and host set in secrets.h
 static IPAddress hook_ip;                  // resolved HERMES_HOOK_HOST; 0.0.0.0 = not yet
@@ -834,7 +853,7 @@ static void handle_status()
     float voltage    = M5StackChan.getBatteryVoltage();
     float current_ma = M5StackChan.getBatteryCurrent() * 1000.0f;  // positive = discharging
 
-    char body[1600];
+    char body[1800];
     snprintf(body, sizeof(body),
              "{\"sketch\":\"%s\",\"version\":\"%s\",\"uptime_s\":%lu,"
              "\"battery_v\":%.2f,\"battery_ma\":%.1f,\"wifi_rssi_dbm\":%d,"
@@ -848,6 +867,7 @@ static void handle_status()
              "\"touch_ok\":%s,\"touch_recals\":%lu,"
              "\"voice_seq\":%lu,\"voice_ready\":%s,\"voices_sent\":%lu,\"voices_failed\":%lu,"
              "\"voices_taken\":%lu,\"voices_expired\":%lu,\"voices_silent\":%lu,\"voice_last\":\"%s\","
+             "\"voice_len_ms\":%lu,\"voice_end\":\"%s\",\"voice_loud_rms\":%d,"
              "\"last_hook_code\":%d,\"hook_ok\":%s,\"hook_ip_known\":%s,\"clock_ok\":%s,"
              "\"requests_served\":%lu}",
              SKETCH_NAME, SKETCH_VERSION, (unsigned long)(millis() / 1000), voltage, current_ma,
@@ -862,7 +882,8 @@ static void handle_status()
              screen_ok ? "true" : "false", touch_chip_ok() ? "true" : "false", (unsigned long)touch_recals,
              (unsigned long)voice_seq, voice_ready ? "true" : "false", (unsigned long)voices_sent,
              (unsigned long)voices_failed, (unsigned long)voices_taken, (unsigned long)voices_expired,
-             (unsigned long)voices_silent, voice_last, last_hook_code, hook_ok ? "true" : "false",
+             (unsigned long)voices_silent, voice_last, (unsigned long)voice_len_ms, voice_end, voice_loud_rms,
+             last_hook_code, hook_ok ? "true" : "false",
              hook_ip_known() ? "true" : "false", clock_ok() ? "true" : "false",
              (unsigned long)(requests_served + 1));
 
@@ -1316,7 +1337,8 @@ static void handle_mic_record()
     }
 
     uint32_t took   = 0;
-    const char* why = record_samples(secs, took);
+    size_t got      = 0;
+    const char* why = record_samples(secs, took, got, false);
     if (why) {
         mic_errors++;
         send_json_error(500, why);
@@ -1359,9 +1381,82 @@ static void measure_level(const int16_t* pcm, size_t samples, int32_t& peak, int
     rms = (int)sqrt(sum_sq / samples);
 }
 
-/* One recording of secs seconds into rec_buf (after MIC_WARMUP), with banner, beep, speaker
- * hand-over and bus check; starts the recording cooldown. Returns nullptr or the reason. */
-static const char* record_samples(int secs, uint32_t& took)
+/*
+ * Talk recording: after the warm-up request, 100 ms pieces are queued back to back (the
+ * library records queued requests without gaps) and each finished piece is checked. Stops
+ * VOICE_END_QUIET_CHUNKS quiet pieces after speech (not before VOICE_MIN_CHUNKS), after
+ * VOICE_NO_SPEECH_CHUNKS without speech, or at secs. got = samples recorded after the warm-up.
+ */
+static const char* capture_until_quiet(int secs, size_t& got)
+{
+    size_t chunks    = (size_t)secs * MIC_RATE / VOICE_CHUNK;
+    size_t queued    = 0;  // pieces handed to the library
+    size_t done      = 0;  // pieces finished and checked
+    size_t quiet_run = 0;
+    bool speech      = false;
+    voice_loud_rms   = 0;
+    voice_end        = "max";
+    got              = 0;
+    if (!M5.Mic.record(rec_buf, MIC_WARMUP, MIC_RATE)) {
+        return "mic record refused";
+    }
+    int shown      = secs;
+    uint32_t t0    = millis();
+    uint32_t limit = (uint32_t)secs * 1000 + 2000;
+    while (done < chunks) {
+        while (queued < chunks && M5.Mic.isRecording() < 2) {
+            if (!M5.Mic.record(rec_buf + MIC_WARMUP + queued * VOICE_CHUNK, VOICE_CHUNK, MIC_RATE)) {
+                got = done * VOICE_CHUNK;
+                return "mic record refused";
+            }
+            queued++;
+        }
+        /* Requests finish in order; the first one is the warm-up */
+        size_t finished = 1 + queued - M5.Mic.isRecording();
+        while (done + 1 < finished && done < chunks) {
+            int32_t peak = 0;
+            int rms      = 0;
+            measure_level(rec_buf + MIC_WARMUP + done * VOICE_CHUNK, VOICE_CHUNK, peak, rms);
+            done++;
+            if (rms > voice_loud_rms) {
+                voice_loud_rms = rms;
+            }
+            if (rms >= VOICE_SPEECH_RMS) {
+                speech    = true;
+                quiet_run = 0;
+            } else if (speech) {
+                quiet_run++;
+            }
+            if (speech && quiet_run >= VOICE_END_QUIET_CHUNKS && done >= VOICE_MIN_CHUNKS) {
+                voice_end = "quiet";
+                got       = done * VOICE_CHUNK;
+                return nullptr;
+            }
+            if (!speech && done >= VOICE_NO_SPEECH_CHUNKS) {
+                voice_end = "no speech";
+                got       = done * VOICE_CHUNK;
+                return nullptr;
+            }
+        }
+        int left = secs - (int)((millis() - t0) / 1000);
+        if (left != shown && left >= 0) {
+            shown = left;
+            draw_mic_banner(left);
+        }
+        if (millis() - t0 > limit) {
+            got = done * VOICE_CHUNK;
+            return "recording timed out";
+        }
+        delay(10);
+    }
+    got = done * VOICE_CHUNK;
+    return nullptr;
+}
+
+/* One recording of up to secs seconds into rec_buf (after MIC_WARMUP), with banner, beep,
+ * speaker hand-over and bus check; starts the recording cooldown. until_quiet = talk rules
+ * (capture_until_quiet); otherwise exactly secs. Returns nullptr or the reason. */
+static const char* record_samples(int secs, uint32_t& took, size_t& got, bool until_quiet)
 {
     draw_mic_banner(secs);  // stays up (over the status or the last camera frame) until cleared
 
@@ -1376,8 +1471,11 @@ static const char* record_samples(int secs, uint32_t& took)
     const char* why = nullptr;
     size_t samples  = (size_t)secs * MIC_RATE;
     uint32_t t0     = millis();
+    got             = 0;
     if (!M5.Mic.begin()) {
         why = "mic begin failed";
+    } else if (until_quiet) {
+        why = capture_until_quiet(secs, got);  // end() below drops any pieces still queued
     } else if (!M5.Mic.record(rec_buf, MIC_WARMUP + samples, MIC_RATE)) {
         why = "mic record refused";
     } else {
@@ -1393,6 +1491,8 @@ static const char* record_samples(int secs, uint32_t& took)
         }
         if (M5.Mic.isRecording()) {
             why = "recording timed out";
+        } else {
+            got = samples;
         }
     }
     M5.Mic.end();  // resets the codec and powers its inputs down
@@ -1445,6 +1545,7 @@ static void wipe_voice(const char* outcome)
     if (voice_buf) {
         memset(voice_buf, 0, VOICE_WAV_BYTES);
     }
+    voice_bytes = 0;
     voice_ready = false;
     voice_last  = outcome;
 }
@@ -1522,7 +1623,7 @@ static int send_hook(uint32_t seq)
     return code;
 }
 
-/* Head tapped or held: record VOICE_SECS, keep the clip, tell Hermes */
+/* Head tapped or held: record until the person stops speaking, keep the clip, tell Hermes */
 static void start_voice()
 {
     if (quiet) {
@@ -1548,28 +1649,32 @@ static void start_voice()
     clear_banner();
     notice_until_ms = 0;
 
-    uint32_t took   = 0;
-    const char* why = record_samples(VOICE_SECS, took);
+    uint32_t took      = 0;
+    size_t samples     = 0;
+    const char* why    = record_samples(VOICE_MAX_SECS, took, samples, true);
+    size_t rec_samples = MIC_WARMUP + (size_t)VOICE_MAX_SECS * MIC_RATE;  // all of it may hold sound
+    voice_len_ms       = samples * 1000 / MIC_RATE;
     if (why) {
+        memset(rec_buf, 0, rec_samples * sizeof(int16_t));
         mic_errors++;
         show_notice(why);
         return;
     }
     recordings_made++;
     const int16_t* pcm = rec_buf + MIC_WARMUP;
-    size_t samples     = (size_t)VOICE_SECS * MIC_RATE;
-    measure_level(pcm, samples, voice_peak, voice_rms);
     voice_seq++;
-    if (voice_rms < VOICE_MIN_RMS) {
-        memset(rec_buf, 0, (MIC_WARMUP + samples) * sizeof(int16_t));
+    if (strcmp(voice_end, "no speech") == 0 || samples == 0) {
+        memset(rec_buf, 0, rec_samples * sizeof(int16_t));
         voices_silent++;
         voice_last = "silent";
         show_notice("heard nothing");
         return;
     }
+    measure_level(pcm, samples, voice_peak, voice_rms);
     write_wav_header(voice_buf, samples * 2);
     memcpy(voice_buf + WAV_HEADER_BYTES, pcm, samples * 2);
-    memset(rec_buf, 0, (MIC_WARMUP + samples) * sizeof(int16_t));
+    voice_bytes = WAV_HEADER_BYTES + samples * 2;
+    memset(rec_buf, 0, rec_samples * sizeof(int16_t));
     voice_ready = true;
     voice_ms    = millis();
 
@@ -1639,7 +1744,7 @@ static void handle_voice_take()
     server.sendHeader("Cache-Control", "no-store");
     server.sendHeader("X-Peak", String(voice_peak));
     server.sendHeader("X-Rms", String(voice_rms));
-    server.send_P(200, "audio/wav", (const char*)voice_buf, VOICE_WAV_BYTES);
+    server.send_P(200, "audio/wav", (const char*)voice_buf, voice_bytes);
     wipe_voice("taken");
 }
 
