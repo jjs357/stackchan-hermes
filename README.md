@@ -101,8 +101,10 @@ and a Mac on the same Wi-Fi network.
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`whisper-cli`) and the `ggml-base.en.bin` model
   in `R5_HermesListen/models/` (not in the repository: about 141 MB)
 - [Ollama](https://ollama.com/) with `gemma3`, only for "what do you see?"
-- A model provider for the Hermes profile. Development used Claude Opus; a local Ollama model
-  should work too, since nothing in the robot or tools depends on the model.
+- A model provider for the Hermes profile. The robot now runs on `minimax-m3.1-flash:cloud`
+  through Ollama (`provider: custom`, `base_url: http://localhost:11434/v1`), which answered
+  about twice as fast as Claude Opus in our tests. Development used Claude Opus. Nothing in the
+  robot or tools depends on the model, as long as it supports tool calls.
 
 ## Setup outline
 
@@ -177,7 +179,7 @@ This is an outline, not a step-by-step tutorial. Read `SETUP-STATUS.md` for the 
 
 ## Roadmap
 
-- Faster replies (currently about 8–30 s from tap to speech)
+- Faster replies (now about 6–8 s from the webhook to speech, plus the 5 s recording)
 - Running the `stackchan` profile on a local model (Ollama) so no text leaves the Mac
 
 ## Acknowledgements
