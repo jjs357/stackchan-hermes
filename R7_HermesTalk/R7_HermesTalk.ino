@@ -3,6 +3,21 @@
  * plus a sprite-based screen, a camera view on the robot's own screen (R7a) and
  * hold-to-talk with Hermes (R7b).
  *
+ * v0.14.0, changes from v0.13.0 (idle life; robot-only, no camera, mic, speech or network):
+ *   - After FACE_AFTER_MS (1 min) with nothing happening, the status screen gives way to a
+ *     simple face that blinks every few seconds; a short tap on the screen (or any request,
+ *     talk or banner) brings the status screen back for another minute
+ *   - After GLANCE_AFTER_MS (2 min) idle, every 3-6 min one small glance: 8° left or right
+ *     or 5° up from where the head is, held GLANCE_HOLD_MS, then back. Same limits, stall
+ *     check and servo power-off as any move (run_move); the eyes look the same way.
+ *   - Never while QUIET, camera view, talk, THINKING, speaking or a banner; no glances at
+ *     night (NIGHT_FROM_H-NIGHT_TO_H local time, ROBOT_TZ; none without NTP time), when the
+ *     face sleeps (eyes closed)
+ *   - POST /idle?on=0|1 (token) turns idle life off or on (on after each restart);
+ *     /status: idle, face, idle_glances
+ *   - Local time: configTzTime(ROBOT_TZ) instead of configTime(0, 0); unix time (webhook
+ *     timestamps) is unchanged
+ *
  * v0.13.0, changes from v0.12.1:
  *   - POST /camera/snap?describe=1 (sent by r34-look.sh, which has the photo described by
  *     gemma3 on the Mac): after the photo is sent, a blue "ANALYZING IMAGE..." banner shows
@@ -168,7 +183,7 @@
 extern "C" int SCCB_Deinit(void);
 
 static const char* SKETCH_NAME      = "R7_HermesTalk";
-static const char* SKETCH_VERSION   = "0.13.0";
+static const char* SKETCH_VERSION   = "0.14.0";
 static const uint16_t HTTP_PORT     = 8080;
 static const size_t MIN_TOKEN_LEN   = 16;
 static const size_t MAX_WAV_BYTES   = 192 * 1024;
@@ -310,6 +325,35 @@ static uint32_t think_start_ms = 0;
 static uint32_t think_mark     = 0;        // activity count when thinking began
 static uint32_t think_max_ms   = THINK_MAX_MS; // PHOTO_THINK_MAX_MS while an image is analyzed
 static uint32_t notice_until_ms = 0;       // 0 = no notice banner showing
+
+/* Idle life (v0.14.0): face and small glances while nothing else is happening */
+static const uint32_t FACE_AFTER_MS     = 60000;
+static const uint32_t GLANCE_AFTER_MS   = 120000;
+static const uint32_t GLANCE_GAP_MIN_MS = 180000;  // 3..6 min between glances
+static const uint32_t GLANCE_GAP_MAX_MS = 360000;
+static const uint32_t GLANCE_HOLD_MS    = 2500;    // >= MOVE_COOLDOWN_MS
+static const int GLANCE_YAW             = 80;      // tenths of a degree
+static const int GLANCE_PITCH           = 50;
+static const int NIGHT_FROM_H           = 22;      // local hours with no glances, face asleep
+static const int NIGHT_TO_H             = 8;
+static const char* ROBOT_TZ             = "EST5EDT,M3.2.0,M11.1.0";  // POSIX TZ: US Eastern
+static const uint32_t BLINK_MS          = 150;
+
+static bool idle_on            = true;
+static uint32_t idle_sig       = 0;        // activity counters when idle began
+static uint32_t idle_since_ms  = 0;
+static uint32_t next_glance_ms = 0;        // 0 = none planned yet
+static uint32_t idle_glances   = 0;
+static bool glance_out         = false;    // head is away from glance_home
+static uint32_t glance_back_ms = 0;
+static int glance_home_yaw     = 0;
+static int glance_home_pitch   = 0;
+static bool face_shown         = false;
+static bool face_asleep        = false;
+static bool eyes_closed        = false;
+static uint32_t blink_ms       = 0;        // next blink start or end
+static int eye_dx              = 0;        // -1 left, 1 right (as the robot sees it)
+static int eye_dy              = 0;        // -1 up
 
 static int last_yaw     = 0;
 static int last_pitch   = 0;
@@ -881,6 +925,7 @@ static void handle_status()
              "\"voices_taken\":%lu,\"voices_expired\":%lu,\"voices_silent\":%lu,\"voice_last\":\"%s\","
              "\"voice_len_ms\":%lu,\"voice_end\":\"%s\",\"voice_loud_rms\":%d,"
              "\"last_hook_code\":%d,\"hook_ok\":%s,\"hook_ip_known\":%s,\"clock_ok\":%s,"
+             "\"idle\":%s,\"face\":%s,\"idle_glances\":%lu,"
              "\"requests_served\":%lu}",
              SKETCH_NAME, SKETCH_VERSION, (unsigned long)(millis() / 1000), voltage, current_ma,
              (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap(), SPEAKER_VOLUME,
@@ -897,6 +942,7 @@ static void handle_status()
              (unsigned long)voices_silent, voice_last, (unsigned long)voice_len_ms, voice_end, voice_loud_rms,
              last_hook_code, hook_ok ? "true" : "false",
              hook_ip_known() ? "true" : "false", clock_ok() ? "true" : "false",
+             idle_on ? "true" : "false", face_shown ? "true" : "false", (unsigned long)idle_glances,
              (unsigned long)(requests_served + 1));
 
     requests_served++;
@@ -1773,7 +1819,11 @@ static void handle_voice_take()
 /* Called from loop(): head taps and holds (talk) and the QUIET toggle */
 static void check_touch()
 {
-    if (M5.Touch.getDetail().wasHold()) {
+    auto& screen_touch = M5.Touch.getDetail();
+    if (screen_touch.wasClicked()) {
+        idle_since_ms = millis();  // a short tap on the screen shows the status again
+    }
+    if (screen_touch.wasHold()) {
         quiet = !quiet;
         if (quiet) {
             view_stop("quiet");
@@ -1789,6 +1839,170 @@ static void check_touch()
     if (M5StackChan.TouchSensor.wasHold() || M5StackChan.TouchSensor.wasClicked()) {
         start_voice();
     }
+}
+
+/* ---------- idle life (v0.14.0) ---------- */
+
+/* Counters that change whenever someone or the Mac does something (idle glances do not) */
+static uint32_t activity_signature()
+{
+    return requests_served + requests_rejected + voices_sent + voices_failed + voices_silent +
+           clips_spoken + photos_taken + recordings_made + views_started + taps_ignored;
+}
+
+/* Anything that must never be interrupted by idle life */
+static bool idle_blocked()
+{
+    return !idle_on || quiet || cam_view || banner_on || voice_ready || thinking ||
+           M5.Speaker.isPlaying();
+}
+
+/* Local night hours; without NTP time it counts as night (no glances) */
+static bool is_night()
+{
+    if (!clock_ok()) {
+        return true;
+    }
+    time_t now = time(nullptr);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    return lt.tm_hour >= NIGHT_FROM_H || lt.tm_hour < NIGHT_TO_H;
+}
+
+static bool can_move_now()
+{
+    return zero_ok && !bus_failed && !M5.Speaker.isPlaying() &&
+           (!has_moved || millis() - last_move_end_ms >= MOVE_COOLDOWN_MS);
+}
+
+/* One small glance away from where the head is; the eyes look the same way */
+static void start_glance()
+{
+    static const int dirs[3][2] = {{-GLANCE_YAW, 0}, {GLANCE_YAW, 0}, {0, GLANCE_PITCH}};
+    int pick = esp_random() % 3;
+    MoveOutcome o;
+    eye_dx = dirs[pick][0] > 0 ? 1 : (dirs[pick][0] < 0 ? -1 : 0);
+    eye_dy = dirs[pick][1] > 0 ? -1 : 0;
+    draw_screen();
+    run_move(dirs[pick][0], dirs[pick][1], true, o);
+    if (o.ok) {
+        idle_glances++;
+        glance_out        = true;
+        glance_home_yaw   = o.start_yaw;
+        glance_home_pitch = o.start_pitch;
+        glance_back_ms    = millis() + GLANCE_HOLD_MS;
+    } else {
+        eye_dx = eye_dy = 0;  // refused (e.g. near a limit) or aborted: stay put
+        draw_screen();
+    }
+}
+
+static void end_glance()
+{
+    MoveOutcome o;
+    glance_out = false;
+    run_move(glance_home_yaw, glance_home_pitch, false, o);
+    eye_dx = eye_dy = 0;
+    draw_screen();
+}
+
+/* Called from loop(): face on/off, blinking, glances */
+static void idle_tick()
+{
+    uint32_t now = millis();
+    uint32_t sig = activity_signature();
+    if (sig != idle_sig || idle_blocked()) {
+        idle_sig       = sig;
+        idle_since_ms  = now;
+        next_glance_ms = 0;
+    }
+    uint32_t idle_ms = now - idle_since_ms;
+
+    /* A glance is brought back, unless something else started meanwhile: then the head stays
+       (a move would end THINKING early, and Hermes or the person decides where it looks) */
+    if (glance_out && (int32_t)(now - glance_back_ms) >= 0 && can_move_now()) {
+        if (quiet || bus_failed || cam_view || voice_ready || thinking) {
+            glance_out = false;
+            eye_dx = eye_dy = 0;
+        } else {
+            end_glance();
+        }
+        return;
+    }
+
+    bool want_face = !idle_blocked() && idle_ms >= FACE_AFTER_MS;
+    bool asleep    = is_night();
+    if (want_face != face_shown || (want_face && asleep != face_asleep)) {
+        face_shown  = want_face;
+        face_asleep = asleep;
+        eyes_closed = false;
+        blink_ms    = now + 3000 + esp_random() % 4000;
+        draw_screen();
+    }
+    if (!face_shown) {
+        return;
+    }
+
+    if (!face_asleep && (int32_t)(now - blink_ms) >= 0) {
+        eyes_closed = !eyes_closed;
+        blink_ms    = now + (eyes_closed ? BLINK_MS : 3000 + esp_random() % 4000);
+        draw_screen();
+    }
+
+    if (face_asleep || glance_out || idle_ms < GLANCE_AFTER_MS) {
+        return;
+    }
+    if (next_glance_ms == 0) {
+        next_glance_ms = now + esp_random() % 60000;  // first glance within a minute
+    }
+    if ((int32_t)(now - next_glance_ms) >= 0 && can_move_now()) {
+        next_glance_ms = now + GLANCE_GAP_MIN_MS + esp_random() % (GLANCE_GAP_MAX_MS - GLANCE_GAP_MIN_MS);
+        start_glance();
+    }
+}
+
+/* The face layer: two eyes (closed while blinking or asleep) and a small smile */
+static void render_face(LovyanGFX& d)
+{
+    d.fillScreen(TFT_BLACK);
+    const int ex[2] = {d.width() / 2 - 60, d.width() / 2 + 60};
+    const int ey    = d.height() / 2 - 25;
+    for (int i = 0; i < 2; i++) {
+        /* The robot's left is the viewer's right */
+        int x = ex[i] - eye_dx * 12;
+        int y = ey + eye_dy * 10;
+        if (eyes_closed || face_asleep) {
+            d.fillRect(x - 20, y - 2, 40, 5, TFT_WHITE);
+        } else {
+            d.fillCircle(x, y, 20, TFT_WHITE);
+        }
+    }
+    d.fillArc(d.width() / 2, ey + 45, 34, 30, 30, 150, TFT_WHITE);
+    if (face_asleep) {
+        d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        d.setCursor(d.width() / 2 + 95, ey - 50);
+        d.print("z z");
+    }
+}
+
+static void handle_idle()
+{
+    if (!is_authorized()) {
+        requests_rejected++;
+        send_json_error(401, "unauthorized");
+        return;
+    }
+    String on = server.arg("on");
+    if (on != "0" && on != "1") {
+        send_json_error(400, "need on=0 or on=1");
+        return;
+    }
+    idle_on = on == "1";
+    requests_served++;
+    char body[80];
+    snprintf(body, sizeof(body), "{\"idle\":%s,\"idle_glances\":%lu}", idle_on ? "true" : "false",
+             (unsigned long)idle_glances);
+    server.send(200, "application/json", body);
 }
 
 static void handle_not_found()
@@ -1880,6 +2094,10 @@ static void draw_screen()
 
 static void render_status(LovyanGFX& d)
 {
+    if (face_shown) {
+        render_face(d);
+        return;
+    }
     d.fillScreen(TFT_BLACK);
     d.setCursor(0, 0);
     if (quiet) {
@@ -1997,7 +2215,7 @@ void setup()
     }
 
     /* R7b: UTC from NTP for webhook timestamps (set in the background); mDNS to find the Mac */
-    configTime(0, 0, "pool.ntp.org", "time.apple.com");
+    configTzTime(ROBOT_TZ, "pool.ntp.org", "time.apple.com");  // local time for night (v0.14.0)
     MDNS.begin("stackchan");
     if (hook_ok && WiFi.status() == WL_CONNECTED) {
         resolve_hook_host();
@@ -2014,6 +2232,7 @@ void setup()
     server.on("/camera/view", HTTP_POST, handle_camera_view);
     server.on("/mic/record", HTTP_POST, handle_mic_record);
     server.on("/voice/take", HTTP_POST, handle_voice_take);
+    server.on("/idle", HTTP_POST, handle_idle);
     server.onNotFound(handle_not_found);
     server.begin();
 
@@ -2036,6 +2255,7 @@ void loop()
     server.handleClient();
     view_tick();
     voice_tick();
+    idle_tick();
 
     if (millis() - last_draw_ms > 2000) {
         last_draw_ms = millis();
