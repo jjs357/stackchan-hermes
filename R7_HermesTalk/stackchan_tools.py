@@ -21,6 +21,22 @@ published checksum) on 127.0.0.1:WHISPER_PORT from r7.conf and stops it on exit,
 stays loaded between clips. r7-clip.sh uses it and falls back to whisper-cli if it is not up.
 Its output is discarded (it could contain transcripts); it runs in an empty private folder.
 
+Turn rules (0.7.0, after a weaker model ran away on 2026-11-01): they hold whatever the model
+does. A turn starts when hear_clip hands out a clip, or with the first robot action after
+TURN_S of quiet. Each turn allows TURN_MAX_ACTIONS calls of say, gesture, look, hear and
+camera_view, refused attempts included. Once they are used up, one say is still allowed if the
+turn has not spoken yet, so the person always hears a reply. look and camera_view on run
+only if the words heard just now ask for the camera (SEE_RE); hear only if they ask to listen
+(LISTEN_RE). A turn with no clip (robot-text route, a chat) has no heard words, so it cannot
+use the camera or mic.
+A new clip starts a new turn: an older run still going shares the new turn's budget.
+
+Dry run (--dry-run DIR, for comparing models): no robot, no whisper, no scripts. hear_clip N
+returns DIR/clips/N.txt (then deletes it), look returns a fixed fake description, the other
+tools pretend to succeed. Turn rules and the call limit still apply, but each hear_clip
+starts afresh (call count and follow-up memory cleared) so questions do not affect each other. Every call, with its
+arguments and result, goes to DIR/calls.jsonl, since only test questions pass through it.
+
 The robot still enforces its own token, limits, cooldowns and QUIET mode. This server adds
 a call limit (30 per 10 minutes) and logs one line per call (time, tool, result) without content.
 Moves and camera_view retry while the robot answers 409 (busy: audio playing), since say returns
@@ -137,6 +153,18 @@ TOOLS = [
 call_times = []  # time.monotonic() of recent calls
 last_move_end = None  # time.monotonic() of the last reply to a move request
 
+ACTION_TOOLS = {"say", "gesture", "look", "hear", "camera_view"}
+TURN_MAX_ACTIONS = 4  # e.g. look_left + look + two says
+TURN_S = 90
+SEE_RE = re.compile(r"\b(see|seeing|saw|camera|photos?|pictures?|view|describe|look(ing)? (at|around)|in front|"
+                    r"who('s|’s| is) (here|there|in)|any(one|body) (here|there))\b", re.I)
+LISTEN_RE = re.compile(r"\b(listen|hear|record)\b", re.I)
+turn_state = {"t": None, "heard": "", "actions": 0, "said": False}  # heard: words of this turn's clip, memory only
+
+DRY_DIR = None  # set by --dry-run DIR
+DRY_LOOK = "A desk with a laptop, a mug and a window behind it. No people are visible."
+DRY_HEAR = "Nothing was heard."
+
 TALK_WINDOW_S = 120  # an exchange is kept this long after its last words
 TALK_MAX_TURNS = 3
 talk_turns = []  # oldest first: {"t": time.monotonic() of last words, "heard": str, "said": [str]}
@@ -159,6 +187,8 @@ def conf_value(name):
 def ensure_whisper():
     """Start whisper-server unless it is running; on any problem leave r7-clip.sh to whisper-cli."""
     global whisper_proc
+    if DRY_DIR:
+        return
     if whisper_proc is not None and whisper_proc.poll() is None:
         return
     whisper_proc = None
@@ -193,9 +223,38 @@ def stop_whisper(proc, workdir):
 
 def run(script, *args, timeout):
     """Run one project script; returns (ok, stdout). No shell, fixed paths."""
+    if DRY_DIR:
+        return dry_run(script, *args)
     proc = subprocess.run([str(PROJECT / script), *args], cwd=PROJECT, capture_output=True,
                           text=True, timeout=timeout)
     return proc.returncode == 0, proc.stdout.strip()
+
+
+def dry_run(script, *args):
+    """Dry run: answer like the robot scripts would, without running them or touching the robot."""
+    if script.endswith("r7-clip.sh"):
+        clip = DRY_DIR / "clips" / f"{args[0]}.txt"
+        if not clip.is_file():
+            return False, "error: no such clip"
+        words = clip.read_text().strip()
+        clip.unlink()  # handed out once, like the robot
+        return True, words
+    if script.endswith("r3-head.sh"):
+        return True, '{"moved":true}\nHTTP 200'
+    if script.endswith("r7-view.sh"):
+        return True, '{"camera_view":%s}\nHTTP 200' % ("true" if args[0] == "on" else "false")
+    if script.endswith("r34-look.sh"):
+        return True, DRY_LOOK
+    if script.endswith("r5-hear.sh"):
+        return True, DRY_HEAR
+    return True, "ok"
+
+
+def dry_log(params, ok, text):
+    """Dry run: one JSON line per call with its arguments and result (test questions only)."""
+    with open(DRY_DIR / "calls.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "tool": params.get("name"),
+                            "args": params.get("arguments"), "ok": ok, "result": text[:200]}) + "\n")
 
 
 def split_reply(out):
@@ -326,12 +385,37 @@ def tool_hear_clip(args):
         earlier.append(f"Person: {turn['heard']}")
         if turn["said"]:
             earlier.append("Robot: " + " ".join(turn["said"]))
+    turn_state.update(t=time.monotonic(), heard=out, actions=0, said=False)
     talk_turns.append({"t": time.monotonic(), "heard": out, "said": []})
     del talk_turns[:-TALK_MAX_TURNS]
     if not earlier:
         return out
     return ("Earlier in this conversation (last 2 minutes, oldest first):\n" + "\n".join(earlier)
             + "\n\nJust now the person said: " + out)
+
+
+def turn_refusal(name, args):
+    """Apply the turn rules to one robot action; returns a reason to refuse, or None."""
+    now = time.monotonic()
+    if turn_state["t"] is None or now - turn_state["t"] >= TURN_S:
+        turn_state.update(t=now, heard="", actions=0, said=False)
+    if turn_state["actions"] >= TURN_MAX_ACTIONS:
+        if name == "say" and not turn_state["said"]:
+            turn_state["said"] = True  # the person always gets one spoken reply
+            return None
+        return (f"this turn has used its {TURN_MAX_ACTIONS} robot actions; "
+                "stop now and end with a one-line text reply")
+    turn_state["actions"] += 1
+    if (name == "look" or (name == "camera_view" and args.get("on") is True)) \
+            and not SEE_RE.search(turn_state["heard"]):
+        return ("not asked: camera not used because the person did not ask to see anything "
+                "(the camera works; do not say it is broken or blocked)")
+    if name == "hear" and not LISTEN_RE.search(turn_state["heard"]):
+        return ("not asked: microphone not used because the person did not ask the robot to listen "
+                "(it works; do not say it is broken)")
+    if name == "say":
+        turn_state["said"] = True
+    return None
 
 
 def prune_talk():
@@ -351,11 +435,19 @@ def call_tool(params):
     if not isinstance(args, dict):
         return False, "arguments must be an object"
     now = time.monotonic()
+    if DRY_DIR and name == "hear_clip":
+        call_times.clear()  # dry run: each question meets a fresh robot (limit and follow-ups)
+        talk_turns.clear()
     call_times[:] = [t for t in call_times if now - t < WINDOW_S]
     if len(call_times) >= MAX_CALLS:
         log(name, "refused-limit")
         return False, f"call limit reached ({MAX_CALLS} per {WINDOW_S // 60} minutes); try again later"
     call_times.append(now)
+    if name in ACTION_TOOLS:
+        reason = turn_refusal(name, args)
+        if reason:
+            log(name, "refused-turn" if reason.startswith("this turn") else "refused-unasked")
+            return False, reason
     try:
         text = HANDLERS[name](args)
     except ToolError as e:
@@ -378,7 +470,15 @@ def reply(msg_id, result=None, error=None):
 
 
 def main():
-    ensure_whisper()
+    global DRY_DIR, LOG, MOVE_COOLDOWN_S
+    if sys.argv[1:2] == ["--dry-run"] and len(sys.argv) == 3:
+        DRY_DIR = Path(sys.argv[2]).resolve()
+        LOG = DRY_DIR / "tools.log"  # keep test runs out of the robot log
+        MOVE_COOLDOWN_S = 0
+    elif sys.argv[1:]:
+        sys.exit("usage: stackchan_tools.py [--dry-run DIR]")
+    else:
+        ensure_whisper()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -394,13 +494,15 @@ def main():
             continue  # notifications (e.g. notifications/initialized) need no reply
         if method == "initialize":
             reply(msg_id, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                           "serverInfo": {"name": "stackchan-tools", "version": "0.6.0"}})
+                           "serverInfo": {"name": "stackchan-tools", "version": "0.7.0"}})
         elif method == "ping":
             reply(msg_id, {})
         elif method == "tools/list":
             reply(msg_id, {"tools": TOOLS})
         elif method == "tools/call":
             ok, text = call_tool(msg.get("params") or {})
+            if DRY_DIR:
+                dry_log(msg.get("params") or {}, ok, text)
             reply(msg_id, {"isError": not ok, "content": [{"type": "text", "text": text}]})
         else:
             reply(msg_id, error={"code": -32601, "message": f"method not found: {method}"})

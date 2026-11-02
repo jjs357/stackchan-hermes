@@ -27,3 +27,6 @@ hello-hermes.txt
 __pycache__/
 *.pyc
 .DS_Store
+
+# Model-comparison dry runs: clips and call logs (results/ is kept)
+R7_HermesTalk/eval/run/

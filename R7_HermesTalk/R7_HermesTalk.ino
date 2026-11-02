@@ -3,6 +3,12 @@
  * plus a sprite-based screen, a camera view on the robot's own screen (R7a) and
  * hold-to-talk with Hermes (R7b).
  *
+ * v0.13.0, changes from v0.12.1:
+ *   - POST /camera/snap?describe=1 (sent by r34-look.sh, which has the photo described by
+ *     gemma3 on the Mac): after the photo is sent, a blue "ANALYZING IMAGE..." banner shows
+ *     until the robot speaks, moves or shows the camera view, or PHOTO_THINK_MAX_MS (90 s).
+ *     A plain /camera/snap (r4-snap.sh, save only) shows no banner, as before.
+ *
  * v0.12.1, changes from v0.12.0:
  *   - A clip ends after 1.2 s of quiet (VOICE_END_QUIET_CHUNKS 12, was 8): a 0.8 s thinking
  *     pause mid-sentence cut a question short in the v0.12.0 robot test
@@ -162,7 +168,7 @@
 extern "C" int SCCB_Deinit(void);
 
 static const char* SKETCH_NAME      = "R7_HermesTalk";
-static const char* SKETCH_VERSION   = "0.12.1";
+static const char* SKETCH_VERSION   = "0.13.0";
 static const uint16_t HTTP_PORT     = 8080;
 static const size_t MIN_TOKEN_LEN   = 16;
 static const size_t MAX_WAV_BYTES   = 192 * 1024;
@@ -271,6 +277,7 @@ static const size_t VOICE_MIN_CHUNKS   = 10;     // never shorter than 1 s
 static const size_t VOICE_NO_SPEECH_CHUNKS = 30; // no speech in the first 3 s = nothing said
 static const uint32_t VOICE_KEEP_MS    = 60000;  // a clip nobody took is wiped after this
 static const uint32_t THINK_MAX_MS     = 45000;
+static const uint32_t PHOTO_THINK_MAX_MS = 90000; // gemma3 on the Mac takes ~40 s per photo
 static const uint32_t NOTICE_MS        = 2500;
 static const uint16_t HOOK_PORT        = 8644;
 static const char* HOOK_PATH           = "/p/stackchan/webhooks/robot-voice";
@@ -301,6 +308,7 @@ static uint32_t boot_id        = 0;        // random per boot, part of each webh
 static bool thinking           = false;
 static uint32_t think_start_ms = 0;
 static uint32_t think_mark     = 0;        // activity count when thinking began
+static uint32_t think_max_ms   = THINK_MAX_MS; // PHOTO_THINK_MAX_MS while an image is analyzed
 static uint32_t notice_until_ms = 0;       // 0 = no notice banner showing
 
 static int last_yaw     = 0;
@@ -1261,6 +1269,15 @@ static void handle_snap()
     /* On ESP32 "PROGMEM" is ordinary memory; this overload sends binary data with a length */
     server.send_P(200, "image/jpeg", (const char*)jpg, len);
     free(jpg);
+
+    if (server.arg("describe") == "1") {
+        /* The Mac is now describing the photo: show that, ended like THINKING */
+        show_banner(TFT_BLUE, "ANALYZING IMAGE...");
+        thinking       = true;
+        think_start_ms = millis();
+        think_max_ms   = PHOTO_THINK_MAX_MS;
+        think_mark     = clips_spoken + moves_done + views_started;
+    }
 }
 
 /* ---------- microphone ---------- */
@@ -1689,6 +1706,7 @@ static void start_voice()
         voice_last     = "sent";
         thinking       = true;
         think_start_ms = millis();
+        think_max_ms   = THINK_MAX_MS;
         think_mark     = clips_spoken + moves_done + views_started;
     } else {
         voices_failed++;
@@ -1705,7 +1723,7 @@ static void voice_tick()
         wipe_voice("expired");
     }
     if (thinking && (clips_spoken + moves_done + views_started != think_mark ||
-                     millis() - think_start_ms > THINK_MAX_MS)) {
+                     millis() - think_start_ms > think_max_ms)) {
         thinking = false;
         if (banner_on && banner_bg == TFT_BLUE) {
             clear_banner();

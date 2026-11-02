@@ -72,7 +72,7 @@ fi
 meta="$(curl -sS --max-time 20 -X POST \
     -H @<(printf 'Authorization: Bearer %s\n' "$token") \
     -o "$img" -w '%{http_code} %{content_type} %{header_json}' \
-    "http://$ip:$port/camera/snap")"
+    "http://$ip:$port/camera/snap?describe=1")"
 unset token
 code="${meta%% *}"
 rest="${meta#* }"
