@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Ask each model the loaded questions through the stackchaneval profile (dry run, no robot).
 
-usage: python3 -I run-eval.py MODEL [MODEL ...] [--only ID[,ID...]]
+usage: python3 -I run-eval.py MODEL [MODEL ...] [--only ID[,ID...]] [--ollama-url URL]
 
 MODEL is "profile" (the model set in stackchaneval's config.yaml) or "ollama:NAME" (an Ollama
-model through http://localhost:11434/v1, local or :cloud). Each question becomes a dry-run clip
+model through http://localhost:11434/v1, local or :cloud; --ollama-url changes that, e.g.
+http://localhost:11435/v1 for an SSH tunnel to another Mac's Ollama). Each question becomes a dry-run clip
 (run/clips/N.txt) and the exact robot-voice prompt from ~/.hermes/config.yaml, then one
 `hermes -p stackchaneval chat --oneshot` run. The tool server's dry-run log (run/calls.jsonl)
 shows what each run tried; results go to results/<time>.jsonl and a summary is printed.
@@ -20,7 +21,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 RUN = HERE / "run"
 CONFIG = Path.home() / ".hermes" / "config.yaml"
-OLLAMA_URL = "http://localhost:11434/v1"
+OLLAMA_URL = "http://localhost:11434/v1"  # --ollama-url overrides
 MAX_TURNS = "30"   # as many model calls as the incident run had: limits are the tool server's job
 # Runs go through the shared gateway: an MCP server with the live one's name ("stackchan") was
 # handed the live connection (2026-11-02), so the eval profile's server is "stackchandry" and
@@ -77,7 +78,12 @@ def ask(prompt, margs):
 
 
 def main(argv):
+    global OLLAMA_URL
     only = None
+    if "--ollama-url" in argv:
+        i = argv.index("--ollama-url")
+        OLLAMA_URL = argv[i + 1]
+        del argv[i:i + 2]
     if "--only" in argv:
         i = argv.index("--only")
         only = set(argv[i + 1].split(","))
