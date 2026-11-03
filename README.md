@@ -118,7 +118,8 @@ This is an outline, not a step-by-step tutorial. Read `SETUP-STATUS.md` for the 
    secret. `secrets.h` is git-ignored. Never commit it.
 2. **Keychain.** Store the token as generic password `stackchan-r1-token` and the webhook secret as
    `stackchan-webhook-secret`. Scripts read them at run time and never print them.
-3. **Robot address.** Set `ROBOT_IP` in each folder's `*.conf` (e.g. `R7_HermesTalk/r7.conf`).
+3. **Robot address.** In each milestone folder, copy `rN.conf.example` to `rN.conf` (e.g.
+   `R7_HermesTalk/r7.conf`) and set `ROBOT_IP` to the robot's address. The `.conf` files are git-ignored.
 4. **Upload** `R7_HermesTalk/R7_HermesTalk.ino` with the Arduino IDE.
 5. **Hermes profile.** Create a `stackchan` profile whose only tool server is
    `stackchan_tools.py` (memory off):
