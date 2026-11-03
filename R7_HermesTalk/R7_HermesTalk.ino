@@ -3,6 +3,14 @@
  * plus a sprite-based screen, a camera view on the robot's own screen (R7a) and
  * hold-to-talk with Hermes (R7b).
  *
+ * v0.15.0, changes from v0.14.0 (talk in a noisy room):
+ *   - The speech line adapts to the room: a 100 ms piece is speech at rms >= the larger of
+ *     VOICE_SPEECH_RMS (200) and VOICE_FLOOR_X (2.5) times the quietest piece so far (the
+ *     room's noise floor). Air conditioning at rms ~160-230 kept every clip going to 8 s.
+ *     Pieces are re-judged as the floor drops, so words said before the first pause still
+ *     count. In a quiet room (floor ~17) the line stays 200, as in v0.14.0.
+ *   - /status: voice_floor_rms (quietest piece of the last talk recording)
+ *
  * v0.14.0, changes from v0.13.0 (idle life; robot-only, no camera, mic, speech or network):
  *   - After FACE_AFTER_MS (1 min) with nothing happening, the status screen gives way to a
  *     simple face that blinks every few seconds; a short tap on the screen (or any request,
@@ -183,7 +191,7 @@
 extern "C" int SCCB_Deinit(void);
 
 static const char* SKETCH_NAME      = "R7_HermesTalk";
-static const char* SKETCH_VERSION   = "0.14.0";
+static const char* SKETCH_VERSION   = "0.15.0";
 static const uint16_t HTTP_PORT     = 8080;
 static const size_t MIN_TOKEN_LEN   = 16;
 static const size_t MAX_WAV_BYTES   = 192 * 1024;
@@ -287,6 +295,7 @@ static const int VOICE_MAX_SECS        = MIC_MAX_SECS;  // 8 s
 static const size_t VOICE_WAV_BYTES    = WAV_HEADER_BYTES + (size_t)VOICE_MAX_SECS * MIC_RATE * 2;
 static const size_t VOICE_CHUNK        = MIC_RATE / 10;  // 100 ms pieces, checked as they arrive
 static const int VOICE_SPEECH_RMS      = 200;    // a piece this loud is speech (room ~17, speech ~1300 average)
+static const int VOICE_FLOOR_X         = 25;     // ...and at least 2.5x (tenths) the quietest piece (v0.15.0)
 static const size_t VOICE_END_QUIET_CHUNKS = 12; // 1.2 s quiet after speech ends the clip
 static const size_t VOICE_MIN_CHUNKS   = 10;     // never shorter than 1 s
 static const size_t VOICE_NO_SPEECH_CHUNKS = 30; // no speech in the first 3 s = nothing said
@@ -316,6 +325,7 @@ static const char* voice_last  = "none";
 static uint32_t voice_len_ms   = 0;        // length of the last talk recording
 static const char* voice_end   = "none";   // why it ended: quiet / max / no speech
 static int voice_loud_rms      = 0;        // loudest 100 ms piece of the last talk recording
+static int voice_floor_rms     = 0;        // quietest 100 ms piece of the last talk recording
 static int last_hook_code      = 0;
 static bool hook_ok            = false;    // secret and host set in secrets.h
 static IPAddress hook_ip;                  // resolved HERMES_HOOK_HOST; 0.0.0.0 = not yet
@@ -923,7 +933,7 @@ static void handle_status()
              "\"touch_ok\":%s,\"touch_recals\":%lu,"
              "\"voice_seq\":%lu,\"voice_ready\":%s,\"voices_sent\":%lu,\"voices_failed\":%lu,"
              "\"voices_taken\":%lu,\"voices_expired\":%lu,\"voices_silent\":%lu,\"voice_last\":\"%s\","
-             "\"voice_len_ms\":%lu,\"voice_end\":\"%s\",\"voice_loud_rms\":%d,"
+             "\"voice_len_ms\":%lu,\"voice_end\":\"%s\",\"voice_loud_rms\":%d,\"voice_floor_rms\":%d,"
              "\"last_hook_code\":%d,\"hook_ok\":%s,\"hook_ip_known\":%s,\"clock_ok\":%s,"
              "\"idle\":%s,\"face\":%s,\"idle_glances\":%lu,"
              "\"requests_served\":%lu}",
@@ -940,6 +950,7 @@ static void handle_status()
              (unsigned long)voice_seq, voice_ready ? "true" : "false", (unsigned long)voices_sent,
              (unsigned long)voices_failed, (unsigned long)voices_taken, (unsigned long)voices_expired,
              (unsigned long)voices_silent, voice_last, (unsigned long)voice_len_ms, voice_end, voice_loud_rms,
+             voice_floor_rms,
              last_hook_code, hook_ok ? "true" : "false",
              hook_ip_known() ? "true" : "false", clock_ok() ? "true" : "false",
              idle_on ? "true" : "false", face_shown ? "true" : "false", (unsigned long)idle_glances,
@@ -1453,15 +1464,17 @@ static void measure_level(const int16_t* pcm, size_t samples, int32_t& peak, int
  * library records queued requests without gaps) and each finished piece is checked. Stops
  * VOICE_END_QUIET_CHUNKS quiet pieces after speech (not before VOICE_MIN_CHUNKS), after
  * VOICE_NO_SPEECH_CHUNKS without speech, or at secs. got = samples recorded after the warm-up.
+ * Speech line: the larger of VOICE_SPEECH_RMS and VOICE_FLOOR_X/10 x the quietest piece so far;
+ * as the floor drops, earlier pieces are judged again against the new line.
  */
 static const char* capture_until_quiet(int secs, size_t& got)
 {
-    size_t chunks    = (size_t)secs * MIC_RATE / VOICE_CHUNK;
+    static int level[VOICE_MAX_SECS * MIC_RATE / VOICE_CHUNK];  // rms of each piece
+    size_t chunks    = std::min<size_t>((size_t)secs * MIC_RATE / VOICE_CHUNK, sizeof(level) / sizeof(level[0]));
     size_t queued    = 0;  // pieces handed to the library
     size_t done      = 0;  // pieces finished and checked
-    size_t quiet_run = 0;
-    bool speech      = false;
     voice_loud_rms   = 0;
+    voice_floor_rms  = 0;
     voice_end        = "max";
     got              = 0;
     if (!M5.Mic.record(rec_buf, MIC_WARMUP, MIC_RATE)) {
@@ -1484,14 +1497,18 @@ static const char* capture_until_quiet(int secs, size_t& got)
             int32_t peak = 0;
             int rms      = 0;
             measure_level(rec_buf + MIC_WARMUP + done * VOICE_CHUNK, VOICE_CHUNK, peak, rms);
-            done++;
+            level[done] = rms;
             if (rms > voice_loud_rms) {
                 voice_loud_rms = rms;
             }
-            if (rms >= VOICE_SPEECH_RMS) {
-                speech    = true;
-                quiet_run = 0;
-            } else if (speech) {
+            if (done == 0 || rms < voice_floor_rms) {
+                voice_floor_rms = rms;
+            }
+            done++;
+            int line         = max(VOICE_SPEECH_RMS, voice_floor_rms * VOICE_FLOOR_X / 10);
+            bool speech      = voice_loud_rms >= line;
+            size_t quiet_run = 0;
+            while (quiet_run < done && level[done - 1 - quiet_run] < line) {
                 quiet_run++;
             }
             if (speech && quiet_run >= VOICE_END_QUIET_CHUNKS && done >= VOICE_MIN_CHUNKS) {
