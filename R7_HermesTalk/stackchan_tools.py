@@ -170,10 +170,15 @@ TALK_MAX_TURNS = 3
 talk_turns = []  # oldest first: {"t": time.monotonic() of last words, "heard": str, "said": [str]}
 
 
-def log(tool, outcome):
+def log(tool, outcome, secs=None):
+    """One line per event; 0.7.1: time to the millisecond, and how long a tool call ran (the
+    gap from one call's end to the next call's start is the model thinking)."""
     LOG.parent.mkdir(exist_ok=True)
+    now = time.time()
+    took = "" if secs is None else f" {secs:.2f}s"
     with open(LOG, "a", encoding="utf-8") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {tool} {outcome}\n")
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}.{int(now % 1 * 1000):03d} "
+                f"{tool} {outcome}{took}\n")
 
 
 def conf_value(name):
@@ -448,15 +453,16 @@ def call_tool(params):
         if reason:
             log(name, "refused-turn" if reason.startswith("this turn") else "refused-unasked")
             return False, reason
+    started = time.monotonic()
     try:
         text = HANDLERS[name](args)
     except ToolError as e:
-        log(name, "error")
+        log(name, "error", time.monotonic() - started)
         return False, str(e)
     except subprocess.TimeoutExpired:
-        log(name, "timeout")
+        log(name, "timeout", time.monotonic() - started)
         return False, "timed out"
-    log(name, "ok")
+    log(name, "ok", time.monotonic() - started)
     return True, text
 
 
@@ -494,7 +500,7 @@ def main():
             continue  # notifications (e.g. notifications/initialized) need no reply
         if method == "initialize":
             reply(msg_id, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                           "serverInfo": {"name": "stackchan-tools", "version": "0.7.0"}})
+                           "serverInfo": {"name": "stackchan-tools", "version": "0.7.1"}})
         elif method == "ping":
             reply(msg_id, {})
         elif method == "tools/list":
