@@ -3,6 +3,15 @@
  * plus a sprite-based screen, a camera view on the robot's own screen (R7a) and
  * hold-to-talk with Hermes (R7b).
  *
+ * v0.16.0, changes from v0.15.0 (the Mac transcribes before the model starts):
+ *   - The talk webhook is sent from its own task, so the robot keeps answering requests while
+ *     it waits: the gateway's route script now fetches the clip (POST /voice/take) and has it
+ *     transcribed before it answers the webhook. Before, the robot could not serve the clip
+ *     until the webhook reply came, so the two would have waited on each other.
+ *   - HOOK_TIMEOUT_MS 10 s (was 3 s): the reply now comes after the transcript (~2 s)
+ *   - THINKING shows from the moment the webhook is sent; a failed webhook ends it with the
+ *     usual notice. A clip already taken by the Mac is not reported as "sent" afterwards.
+ *
  * v0.15.0, changes from v0.14.0 (talk in a noisy room):
  *   - The speech line adapts to the room: a 100 ms piece is speech at rms >= the larger of
  *     VOICE_SPEECH_RMS (200) and VOICE_FLOOR_X (2.5) times the quietest piece so far (the
@@ -191,7 +200,7 @@
 extern "C" int SCCB_Deinit(void);
 
 static const char* SKETCH_NAME      = "R7_HermesTalk";
-static const char* SKETCH_VERSION   = "0.15.0";
+static const char* SKETCH_VERSION   = "0.16.0";
 static const uint16_t HTTP_PORT     = 8080;
 static const size_t MIN_TOKEN_LEN   = 16;
 static const size_t MAX_WAV_BYTES   = 192 * 1024;
@@ -305,7 +314,8 @@ static const uint32_t PHOTO_THINK_MAX_MS = 90000; // gemma3 on the Mac takes ~40
 static const uint32_t NOTICE_MS        = 2500;
 static const uint16_t HOOK_PORT        = 8644;
 static const char* HOOK_PATH           = "/p/stackchan/webhooks/robot-voice";
-static const uint32_t HOOK_TIMEOUT_MS  = 3000;
+static const uint32_t HOOK_TIMEOUT_MS  = 10000;  // reply comes after the Mac's transcript (v0.16.0)
+static const uint32_t HOOK_TASK_STACK  = 8192;
 static const size_t MIN_HOOK_SECRET    = 32;
 static const time_t CLOCK_VALID_AFTER  = 1700000000;  // NTP has set the clock (Nov 2023)
 
@@ -331,6 +341,10 @@ static bool hook_ok            = false;    // secret and host set in secrets.h
 static IPAddress hook_ip;                  // resolved HERMES_HOOK_HOST; 0.0.0.0 = not yet
 static uint32_t boot_id        = 0;        // random per boot, part of each webhook's X-Request-ID
 static bool thinking           = false;
+static volatile bool hook_pending = false;  // the webhook task is running (v0.16.0)
+static volatile bool hook_done    = false;  // ...and has finished; hook_code holds its result
+static volatile int hook_code     = 0;
+static uint32_t hook_seq          = 0;      // clip number the task is announcing
 static uint32_t think_start_ms = 0;
 static uint32_t think_mark     = 0;        // activity count when thinking began
 static uint32_t think_max_ms   = THINK_MAX_MS; // PHOTO_THINK_MAX_MS while an image is analyzed
@@ -1707,6 +1721,8 @@ static int send_hook(uint32_t seq)
     return code;
 }
 
+static void hook_task(void*);
+
 /* Head tapped or held: record until the person stops speaking, keep the clip, tell Hermes */
 static void start_voice()
 {
@@ -1721,7 +1737,7 @@ static void start_voice()
         no = "mic unavailable";
     } else if (!clock_ok()) {
         no = "no clock yet";
-    } else if (voice_ready || thinking || M5.Speaker.isPlaying()) {
+    } else if (voice_ready || thinking || hook_pending || M5.Speaker.isPlaying()) {
         no = "busy";
     } else if (has_recorded && millis() - last_rec_ms < REC_COOLDOWN_MS) {
         no = "wait a moment";
@@ -1763,24 +1779,56 @@ static void start_voice()
     voice_ms    = millis();
 
     show_banner(TFT_BLUE, "THINKING...");
-    last_hook_code = send_hook(voice_seq);
-    if (last_hook_code == 202 || last_hook_code == 200) {
-        voices_sent++;
-        voice_last     = "sent";
-        thinking       = true;
-        think_start_ms = millis();
-        think_max_ms   = THINK_MAX_MS;
-        think_mark     = clips_spoken + moves_done + views_started;
-    } else {
-        voices_failed++;
-        wipe_voice(last_hook_code == -100 ? "mac not found" : "hook failed");
-        show_notice(voice_last);
+    thinking       = true;
+    think_start_ms = millis();
+    think_max_ms   = THINK_MAX_MS;
+    think_mark     = clips_spoken + moves_done + views_started;
+    hook_seq       = voice_seq;
+    hook_done      = false;
+    hook_pending   = true;
+    if (xTaskCreate(hook_task, "hook", HOOK_TASK_STACK, nullptr, 1, nullptr) != pdPASS) {
+        hook_code = send_hook(hook_seq);  // no task: send in place (the Mac then falls back to hear_clip)
+        hook_done = true;
     }
+}
+
+/* The webhook, off the main loop so /voice/take can be served while the Mac transcribes */
+static void hook_task(void*)
+{
+    hook_code = send_hook(hook_seq);
+    hook_done = true;
+    vTaskDelete(nullptr);
+}
+
+/* From voice_tick(): the webhook task's result */
+static void finish_hook(int code)
+{
+    last_hook_code = code;
+    if (code == 202 || code == 200) {
+        voices_sent++;
+        if (voice_ready) {
+            voice_last = "sent";  // not yet taken; a taken clip keeps "taken"
+        }
+        return;
+    }
+    voices_failed++;
+    thinking = false;
+    const char* why = code == -100 ? "mac not found" : "hook failed";
+    if (voice_ready) {
+        wipe_voice(why);
+    } else {
+        voice_last = why;
+    }
+    show_notice(why);
 }
 
 /* Called from loop(): clip expiry, end of THINKING, notices */
 static void voice_tick()
 {
+    if (hook_pending && hook_done) {
+        hook_pending = false;
+        finish_hook(hook_code);
+    }
     if (voice_ready && millis() - voice_ms > VOICE_KEEP_MS) {
         voices_expired++;
         wipe_voice("expired");

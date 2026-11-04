@@ -31,6 +31,15 @@ only if the words heard just now ask for the camera (SEE_RE); hear only if they 
 use the camera or mic.
 A new clip starts a new turn: an older run still going shares the new turn's budget.
 
+Early transcript (0.8.0): so the model starts with the words instead of spending a call on
+hear_clip, the robot-voice route runs hermes-scripts/stackchan-heard.py before the model. It
+asks this server, over a Unix socket only the user can open (HEARD_SOCK, folder mode 700),
+for clip N; the server does exactly what hear_clip does (fetch, transcribe, start the turn, add
+earlier exchanges) and returns the text, which the script puts into the prompt. The text is
+also kept in memory for a later hear_clip N, so a model that calls it anyway gets the same
+words (the robot hands a clip out once). A tool call in progress holds a lock; the socket waits
+at most EARLY_WAIT_S for it, then says busy and the model falls back to hear_clip.
+
 Dry run (--dry-run DIR, for comparing models): no robot, no whisper, no scripts. hear_clip N
 returns DIR/clips/N.txt (then deletes it), look returns a fixed fake description, the other
 tools pretend to succeed. Turn rules and the call limit still apply, but each hear_clip
@@ -47,9 +56,11 @@ import hashlib
 import json
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -164,6 +175,12 @@ turn_state = {"t": None, "heard": "", "actions": 0, "said": False}  # heard: wor
 DRY_DIR = None  # set by --dry-run DIR
 DRY_LOOK = "A desk with a laptop, a mug and a window behind it. No people are visible."
 DRY_HEAR = "Nothing was heard."
+
+HEARD_SOCK = Path.home() / ".hermes" / "stackchan" / "heard.sock"  # dry run: DIR/heard.sock
+EARLY_WAIT_S = 5     # robot gives up on the webhook after 10 s; the script after 8 s
+EARLY_KEEP = 3
+early_clips = {}     # clip -> text already given to the route script, memory only
+tool_lock = threading.Lock()  # one tool call at a time (MCP requests and the socket)
 
 TALK_WINDOW_S = 120  # an exchange is kept this long after its last words
 TALK_MAX_TURNS = 3
@@ -380,6 +397,8 @@ def tool_hear_clip(args):
     clip = args.get("clip")
     if not isinstance(clip, int) or isinstance(clip, bool) or not 1 <= clip <= 999999999:
         raise ToolError("clip must be an integer 1..999999999")
+    if clip in early_clips:
+        return early_clips.pop(clip)  # the route script took it already: same words, same turn
     ensure_whisper()  # restarts it if it has stopped; this clip may still use whisper-cli
     ok, out = run("R7_HermesTalk/r7-clip.sh", str(clip), timeout=60)
     if not ok:
@@ -408,6 +427,9 @@ def turn_refusal(name, args):
         if name == "say" and not turn_state["said"]:
             turn_state["said"] = True  # the person always gets one spoken reply
             return None
+        if not turn_state["said"]:  # 0.8.0: point at the reply that is still allowed
+            return (f"this turn has used its {TURN_MAX_ACTIONS} robot actions; nothing has been said yet, "
+                    "so call say once now with your answer, then stop")
         return (f"this turn has used its {TURN_MAX_ACTIONS} robot actions; "
                 "stop now and end with a one-line text reply")
     turn_state["actions"] += 1
@@ -432,8 +454,9 @@ HANDLERS = {"say": tool_say, "gesture": tool_gesture, "look": tool_look, "hear":
             "camera_view": tool_camera_view, "hear_clip": tool_hear_clip}
 
 
-def call_tool(params):
+def call_tool(params, early=False):
     name = params.get("name")
+    label = name + "-early" if early else name
     args = params.get("arguments") or {}
     if name not in HANDLERS:
         return False, f"unknown tool {name!r}"
@@ -445,7 +468,7 @@ def call_tool(params):
         talk_turns.clear()
     call_times[:] = [t for t in call_times if now - t < WINDOW_S]
     if len(call_times) >= MAX_CALLS:
-        log(name, "refused-limit")
+        log(label, "refused-limit")
         return False, f"call limit reached ({MAX_CALLS} per {WINDOW_S // 60} minutes); try again later"
     call_times.append(now)
     if name in ACTION_TOOLS:
@@ -457,13 +480,57 @@ def call_tool(params):
     try:
         text = HANDLERS[name](args)
     except ToolError as e:
-        log(name, "error", time.monotonic() - started)
+        log(label, "error", time.monotonic() - started)
         return False, str(e)
     except subprocess.TimeoutExpired:
-        log(name, "timeout", time.monotonic() - started)
+        log(label, "timeout", time.monotonic() - started)
         return False, "timed out"
-    log(name, "ok", time.monotonic() - started)
+    log(label, "ok", time.monotonic() - started)
     return True, text
+
+
+def serve_heard(path):
+    """Socket for the route script: one JSON line {"clip": N} in, {"ok": bool, "text": str} out."""
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
+        path.unlink(missing_ok=True)  # left over from a server that did not exit cleanly
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(path))
+        path.chmod(0o600)
+        srv.listen(2)
+    except OSError:
+        log("heard-socket", "not-started")  # the model then calls hear_clip itself
+        return
+    atexit.register(path.unlink, missing_ok=True)
+    while True:
+        conn, _ = srv.accept()
+        with conn:
+            try:
+                conn.settimeout(2)
+                line = conn.makefile("r", encoding="utf-8").readline(200)
+                clip = json.loads(line).get("clip")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if not tool_lock.acquire(timeout=EARLY_WAIT_S):
+                ok, text = False, "busy"
+                log("hear_clip-early", "busy")
+            else:
+                try:
+                    params = {"name": "hear_clip", "arguments": {"clip": clip}}
+                    ok, text = call_tool(params, early=True)
+                    if DRY_DIR:
+                        dry_log(params, ok, text)
+                    if ok:
+                        early_clips[clip] = text
+                        for old in list(early_clips)[:-EARLY_KEEP]:
+                            del early_clips[old]
+                finally:
+                    tool_lock.release()
+            try:
+                conn.sendall((json.dumps({"ok": ok, "text": text}) + "\n").encode())
+            except OSError:
+                pass
 
 
 def reply(msg_id, result=None, error=None):
@@ -485,6 +552,8 @@ def main():
         sys.exit("usage: stackchan_tools.py [--dry-run DIR]")
     else:
         ensure_whisper()
+    threading.Thread(target=serve_heard, args=(DRY_DIR / "heard.sock" if DRY_DIR else HEARD_SOCK,),
+                     daemon=True).start()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -500,13 +569,14 @@ def main():
             continue  # notifications (e.g. notifications/initialized) need no reply
         if method == "initialize":
             reply(msg_id, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                           "serverInfo": {"name": "stackchan-tools", "version": "0.7.1"}})
+                           "serverInfo": {"name": "stackchan-tools", "version": "0.8.0"}})
         elif method == "ping":
             reply(msg_id, {})
         elif method == "tools/list":
             reply(msg_id, {"tools": TOOLS})
         elif method == "tools/call":
-            ok, text = call_tool(msg.get("params") or {})
+            with tool_lock:
+                ok, text = call_tool(msg.get("params") or {})
             if DRY_DIR:
                 dry_log(msg.get("params") or {}, ok, text)
             reply(msg_id, {"isError": not ok, "content": [{"type": "text", "text": text}]})

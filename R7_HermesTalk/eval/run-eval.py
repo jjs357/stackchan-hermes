@@ -6,12 +6,14 @@ usage: python3 -I run-eval.py MODEL [MODEL ...] [--only ID[,ID...]] [--ollama-ur
 MODEL is "profile" (the model set in stackchaneval's config.yaml) or "ollama:NAME" (an Ollama
 model through http://localhost:11434/v1, local or :cloud; --ollama-url changes that, e.g.
 http://localhost:11435/v1 for an SSH tunnel to another Mac's Ollama). Each question becomes a dry-run clip
-(run/clips/N.txt) and the exact robot-voice prompt from ~/.hermes/config.yaml, then one
+(run/clips/N.txt), transcribed early through the dry-run server's socket as the route script
+does (tool server 0.8.0), and the exact robot-voice prompt from ~/.hermes/config.yaml, then one
 `hermes -p stackchaneval chat --oneshot` run. The tool server's dry-run log (run/calls.jsonl)
 shows what each run tried; results go to results/<time>.jsonl and a summary is printed.
 The question text goes to the model's provider; nothing reaches the robot.
 """
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -28,6 +30,18 @@ MAX_TURNS = "30"   # as many model calls as the incident run had: limits are the
 # every model must first pass a hear_clip-only preflight that lands in the dry-run log.
 PREFLIGHT = "Call hear_clip with clip {clip}. Then reply with exactly the text it returned. Call no other tool."
 ACTIONS = {"say", "gesture", "look", "hear", "camera_view"}
+_spec = importlib.util.spec_from_file_location("heard", HERE.parent / "hermes-scripts/stackchan-heard.py")
+heard_script = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(heard_script)
+heard_script.SOCK = RUN / "heard.sock"  # the dry-run server's socket, not the robot's
+
+
+def early_words(clip):
+    """What the robot-voice route script would put into {heard}."""
+    try:
+        return heard_script.heard(clip)
+    except (OSError, ValueError, KeyError):
+        return heard_script.FALLBACK
 
 
 def robot_voice_prompt():
@@ -113,7 +127,8 @@ def main(argv):
             clip += 1
             (RUN / "clips" / f"{clip}.txt").write_text(q["words"] + "\n")
             started = time.monotonic()
-            proc = ask(template.replace("{clip}", str(clip)), margs)
+            words = early_words(clip)
+            proc = ask(template.replace("{clip}", str(clip)).replace("{heard}", words), margs)
             secs = round(time.monotonic() - started, 1)
             calls, offset = calls_since(offset)
             (RUN / "clips" / f"{clip}.txt").unlink(missing_ok=True)
