@@ -2,3 +2,5 @@
 # (service "stackchan-r1-token", shared with R1-R4), never in this file.
 ROBOT_IP=192.0.2.10
 ROBOT_PORT=8080
+# Optional: the local Ollama vision model for photo descriptions (default gemma3:latest)
+# VISION_MODEL=gemma3:27b

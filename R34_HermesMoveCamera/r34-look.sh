@@ -15,7 +15,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 conf="$here/r34.conf"
 keepdir="$here/../R4_HermesCamera/captures"
-model="gemma3:latest"
+model="gemma3:latest"  # VISION_MODEL= in r34.conf overrides (e.g. gemma3:27b on a bigger Mac)
 ollama="http://127.0.0.1:11434"
 max_bytes=262144
 prompt="This photo was taken by a small desk robot's camera. In 2 to 4 sentences, describe the main objects, the setting and the lighting. If people are visible, do not guess who they are."
@@ -33,6 +33,14 @@ port="$(sed -n 's/^ROBOT_PORT=//p' "$conf")"
 if ! [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ && "$port" =~ ^[0-9]{1,5}$ ]]; then
     echo "error: ROBOT_IP/ROBOT_PORT missing or invalid in r34.conf" >&2
     exit 2
+fi
+vision="$(sed -n 's/^VISION_MODEL=//p' "$conf")"
+if [[ -n "$vision" ]]; then
+    if ! [[ "$vision" =~ ^[A-Za-z0-9._/-]+(:[A-Za-z0-9._-]+)?$ ]]; then
+        echo "error: VISION_MODEL invalid in r34.conf" >&2
+        exit 2
+    fi
+    model="$vision"  # still checked below: must be local and able to see images
 fi
 
 umask 077
