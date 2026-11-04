@@ -1,0 +1,46 @@
+# Hermes profile "stackchaneval": dry runs for comparing models (R7_HermesTalk/eval/). The tool
+# server runs with --dry-run: no robot, no whisper, no scripts. Its MCP server name must NOT be
+# "stackchan": the shared gateway hands a same-named server the LIVE robot connection.
+# Install (README, "Hermes setup"): fill in @PYTHON@ and @REPO@ with sed and write the result
+# to ~/.hermes/profiles/stackchaneval/config.yaml. Model: Opus on a Claude Pro/Max subscription
+# through the claude-subscription-directsdk plugin (needs Claude Code installed and logged in).
+model:
+  default: claude-opus-5-5[1m]
+  provider: claude-subscription-directsdk-experimental
+  base_url: process://claude-subscription-directsdk-experimental
+  api_mode: chat_completions
+plugins:
+  enabled:
+    - claude-subscription-directsdk-experimental
+mcp_servers:
+  stackchandry:
+    command: @PYTHON@
+    args:
+      - -I
+      - @REPO@/R7_HermesTalk/stackchan_tools.py
+      - --dry-run
+      - @REPO@/R7_HermesTalk/eval/run
+platform_toolsets:
+  cli:
+    - stackchandry
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+approvals:
+  deny:
+    - '*captures*'
+    - '*jpg*'
+    - '*jpeg*'
+    - '*base64*'
+    - '*xxd*'
+    - '*hexdump*'
+    - '*r4-snap*'
+    - '*--keep*'
+    - '*wav*'
+    - '*recordings*'
+    - '*r5-record*'
+agent:
+  reasoning_effort: medium
+tools:
+  tool_search:
+    enabled: "off"   # list the 6 robot tools up front: saves a model round trip per turn

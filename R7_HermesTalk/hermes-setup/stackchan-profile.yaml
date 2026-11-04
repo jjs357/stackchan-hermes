@@ -1,0 +1,42 @@
+# Hermes profile "stackchan": the robot's own agent. Its ONLY tools are the robot tools.
+# Install (README, "Hermes setup"): fill in @PYTHON@ and @REPO@ with sed and write the result
+# to ~/.hermes/profiles/stackchan/config.yaml. Model: Opus on a Claude Pro/Max subscription
+# through the claude-subscription-directsdk plugin (needs Claude Code installed and logged in).
+model:
+  default: claude-opus-5-5[1m]
+  provider: claude-subscription-directsdk-experimental
+  base_url: process://claude-subscription-directsdk-experimental
+  api_mode: chat_completions
+plugins:
+  enabled:
+    - claude-subscription-directsdk-experimental
+mcp_servers:
+  stackchan:
+    command: @PYTHON@
+    args:
+      - -I
+      - @REPO@/R7_HermesTalk/stackchan_tools.py
+platform_toolsets:
+  cli:
+    - stackchan
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+approvals:
+  deny:
+    - '*captures*'
+    - '*jpg*'
+    - '*jpeg*'
+    - '*base64*'
+    - '*xxd*'
+    - '*hexdump*'
+    - '*r4-snap*'
+    - '*--keep*'
+    - '*wav*'
+    - '*recordings*'
+    - '*r5-record*'
+agent:
+  reasoning_effort: medium
+tools:
+  tool_search:
+    enabled: "off"   # list the 6 robot tools up front: saves a model round trip per turn
