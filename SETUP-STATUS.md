@@ -1,8 +1,11 @@
 # StackChan + Hermes — Setup Status
 
-Last updated: 2026-11-04 · R1–R7a complete · R7b core complete (robot on R7_HermesTalk v0.16.0, served by a second Mac since 2026-11-04)
+Last updated: 2026-11-05 · R1–R7a complete · R7b core complete (robot on R7_HermesTalk v0.16.0; tool server 0.8.1)
 
-**Latest (2026-11-04):**
+**Latest (2026-11-05):**
+- Bug fix, tool server 0.8.1: after the robot restarted, every talk turn got the words of an earlier clip ("look up") instead of the new recording. Cause: 0.8.0 kept each early transcript in memory under its clip number and never removed it once the model had the words; the robot numbers clips from 1 again after every restart, so the next "clip 1" reused the old text and the new recording was never fetched (robot status: `voices_taken 0`, `voices_expired 1`). Fix: a new webhook always fetches fresh, and kept words are used only within 30 s. Robot test **PASS**: two different commands, robot restart, a third command as clip 1 got its own words. The robot is served by the first Mac again for now; the second Mac needs `git pull` + `hermes gateway restart`
+
+**Earlier (2026-11-04):**
 - R7 moved to a second Mac (Apple Silicon) from a plain `git clone`: Homebrew Python 3.13 + whisper.cpp, Claude Code login, Hermes, both robot profiles, routes and route script; `gemma3:27b` for photos via the new `VISION_MODEL` setting. Dry run 12/12, robot test **PASS**: webhook → first action ~3.5 s, photo turn `look` 12.7 s (was 36 s). The first Mac stays as fallback (switch back = `HERMES_HOOK_HOST` + re-upload). README now has a full step-by-step setup and an upkeep/troubleshooting section, with config templates in `R7_HermesTalk/hermes-setup/`
 - Early transcript: the robot-voice route runs a script that has the tool server transcribe the clip before the model starts, so Opus begins with the words (one model call fewer). Sketch v0.16.0 sends the webhook from its own task so the robot can hand out the clip meanwhile. Robot test **PASS**: webhook → first action 6.5–8.3 s (was 9.6–10.6 s). The words are marked in the prompt as a person's request, not instructions (an injection test took three photos before that wording)
 

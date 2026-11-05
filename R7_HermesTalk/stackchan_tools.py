@@ -39,6 +39,8 @@ earlier exchanges) and returns the text, which the script puts into the prompt. 
 also kept in memory for a later hear_clip N, so a model that calls it anyway gets the same
 words (the robot hands a clip out once). A tool call in progress holds a lock; the socket waits
 at most EARLY_WAIT_S for it, then says busy and the model falls back to hear_clip.
+0.8.1: the kept text expires after EARLY_MAX_AGE_S and a new webhook always fetches fresh,
+since the robot numbers clips from 1 again after every restart (0.8.0 replayed an old clip 1).
 
 Dry run (--dry-run DIR, for comparing models): no robot, no whisper, no scripts. hear_clip N
 returns DIR/clips/N.txt (then deletes it), look returns a fixed fake description, the other
@@ -179,7 +181,8 @@ DRY_HEAR = "Nothing was heard."
 HEARD_SOCK = Path.home() / ".hermes" / "stackchan" / "heard.sock"  # dry run: DIR/heard.sock
 EARLY_WAIT_S = 5     # robot gives up on the webhook after 10 s; the script after 8 s
 EARLY_KEEP = 3
-early_clips = {}     # clip -> text already given to the route script, memory only
+EARLY_MAX_AGE_S = 30  # 0.8.1: the robot restarts clip numbers at 1 after each reboot
+early_clips = {}     # clip -> (time.monotonic(), text) given to the route script, memory only
 tool_lock = threading.Lock()  # one tool call at a time (MCP requests and the socket)
 
 TALK_WINDOW_S = 120  # an exchange is kept this long after its last words
@@ -397,8 +400,9 @@ def tool_hear_clip(args):
     clip = args.get("clip")
     if not isinstance(clip, int) or isinstance(clip, bool) or not 1 <= clip <= 999999999:
         raise ToolError("clip must be an integer 1..999999999")
-    if clip in early_clips:
-        return early_clips.pop(clip)  # the route script took it already: same words, same turn
+    entry = early_clips.pop(clip, None)
+    if entry and time.monotonic() - entry[0] < EARLY_MAX_AGE_S:
+        return entry[1]  # the route script took it moments ago: same words, same turn
     ensure_whisper()  # restarts it if it has stopped; this clip may still use whisper-cli
     ok, out = run("R7_HermesTalk/r7-clip.sh", str(clip), timeout=60)
     if not ok:
@@ -518,11 +522,12 @@ def serve_heard(path):
             else:
                 try:
                     params = {"name": "hear_clip", "arguments": {"clip": clip}}
+                    early_clips.pop(clip, None)  # 0.8.1: a new webhook is a new recording
                     ok, text = call_tool(params, early=True)
                     if DRY_DIR:
                         dry_log(params, ok, text)
                     if ok:
-                        early_clips[clip] = text
+                        early_clips[clip] = (time.monotonic(), text)
                         for old in list(early_clips)[:-EARLY_KEEP]:
                             del early_clips[old]
                 finally:
@@ -569,7 +574,7 @@ def main():
             continue  # notifications (e.g. notifications/initialized) need no reply
         if method == "initialize":
             reply(msg_id, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                           "serverInfo": {"name": "stackchan-tools", "version": "0.8.0"}})
+                           "serverInfo": {"name": "stackchan-tools", "version": "0.8.1"}})
         elif method == "ping":
             reply(msg_id, {})
         elif method == "tools/list":
