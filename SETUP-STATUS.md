@@ -1,8 +1,9 @@
 # StackChan + Hermes — Setup Status
 
-Last updated: 2026-11-05 · R1–R7a complete · R7b core complete (robot on R7_HermesTalk v0.16.0; tool server 0.8.1)
+Last updated: 2026-11-05 · R1–R7a complete · R7b core complete (robot on R7_HermesTalk v0.17.0, settings saved on the robot; tool server 0.8.1)
 
 **Latest (2026-11-05):**
+- Release milestone, steps 1–3 (user approved): sketch v0.17.0 keeps Wi-Fi, token, hook host and hook secret in the robot's settings storage (NVS namespace `hermes`; the servo calibration in `servo` is never touched) and takes them over the USB cable (HELLO/STATUS/SET/SAVE/CLEAR/REBOOT; secrets are never printed). `secrets.h` is now optional and only used when nothing is saved. New `tools/stackchan-setup.py` reuses or makes the token and webhook secret (Keychain, `~/.hermes/.env`), asks for Wi-Fi, sends everything to the robot, restarts it and writes `ROBOT_IP` into the `rN.conf` files. Simulator test 16/16. Robot test **PASS**: v0.17.0 behaved as before on `secrets.h`; after the script, `/status` shows `settings: saved`, `servo_zero_ok: true`; "look left" and "say hello" answered by the second Mac. Note: the board's default 16 MB layout keeps NVS at 0x9000–0xDFFF, and the exported `merged.bin` is a full 16 MB image that would erase it, so a release must flash the separate parts only
 - Bug fix, tool server 0.8.1: after the robot restarted, every talk turn got the words of an earlier clip ("look up") instead of the new recording. Cause: 0.8.0 kept each early transcript in memory under its clip number and never removed it once the model had the words; the robot numbers clips from 1 again after every restart, so the next "clip 1" reused the old text and the new recording was never fetched (robot status: `voices_taken 0`, `voices_expired 1`). Fix: a new webhook always fetches fresh, and kept words are used only within 30 s. Robot test **PASS**: two different commands, robot restart, a third command as clip 1 got its own words. The robot is served by the first Mac again for now; the second Mac needs `git pull` + `hermes gateway restart`
 
 **Earlier (2026-11-04):**

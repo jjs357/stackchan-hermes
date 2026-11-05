@@ -3,6 +3,18 @@
  * plus a sprite-based screen, a camera view on the robot's own screen (R7a) and
  * hold-to-talk with Hermes (R7b).
  *
+ * v0.17.0, changes from v0.16.0 (settings on the robot, for prebuilt release firmware):
+ *   - Wi-Fi, token, hook host and hook secret can live in the robot's settings storage (NVS
+ *     namespace "hermes"), written over the USB cable by tools/stackchan-setup.py on the
+ *     Mac. Saved settings win; secrets.h is now optional and used only when nothing is saved.
+ *     The servo calibration ("servo" namespace) is never touched.
+ *   - USB serial setup, one command per line, replies start with "@R7 ":
+ *       HELLO, STATUS, SET <key> <value>, SAVE, CLEAR, REBOOT
+ *     keys: ssid, pass, token, hook_host, hook_secret. SET only stages a value; SAVE checks
+ *     all five and stores them together; they apply after REBOOT. Nothing ever prints the
+ *     password, token or secret (STATUS gives "set"/"missing" and lengths only).
+ *   - Screen: "SETUP NEEDED" when nothing is set; /status: "settings" (saved/secrets.h/none)
+ *
  * v0.16.0, changes from v0.15.0 (the Mac transcribes before the model starts):
  *   - The talk webhook is sent from its own task, so the robot keeps answering requests while
  *     it waits: the gateway's route script now fetches the clip (POST /voice/take) and has it
@@ -159,10 +171,11 @@
  * Not used: LEDs, IR, NFC.
  *
  * Setup:
- *   1. Copy your secrets.h (same token) into this folder. R7b adds HERMES_HOOK_HOST (the
- *      Mac's name, e.g. "mymac.local") and HERMES_HOOK_SECRET (the gateway route's secret).
- *   2. Board: Espressif "esp32" package -> "M5CoreS3", PSRAM enabled (the default).
- *   3. Upload with the Arduino IDE.
+ *   1. Settings: EITHER run tools/stackchan-setup.py after uploading (stores them on the
+ *      robot), OR copy secrets.h.example to secrets.h in this folder and fill it in.
+ *   2. Board: Espressif "esp32" package -> "M5CoreS3", PSRAM enabled, USB CDC On Boot
+ *      enabled (all the defaults).
+ *   3. Upload with the Arduino IDE, or flash a release build with esptool (RELEASE.md).
  *
  * Mac scripts (unchanged, same IP/port): ../R3_HermesMove/r3-head.sh,
  * ../R2_HermesGreeting/r2-say.sh, ../R4_HermesCamera/r4-snap.sh and r4-describe.sh.
@@ -186,12 +199,20 @@
 #include <utils/settings/settings.h>
 #include <esp_camera.h>
 #include <img_converters.h>
-#include "secrets.h"
+#include <nvs.h>
 #include "move_rules.h"
 #include "move_outcome.h"
+#include "robot_config.h"
 
+/* v0.17.0: secrets.h is optional; settings saved on the robot win over it */
+#if __has_include("secrets.h")
+#include "secrets.h"
 #if !defined(HERMES_HOOK_HOST) || !defined(HERMES_HOOK_SECRET)
 #error "secrets.h needs HERMES_HOOK_HOST and HERMES_HOOK_SECRET for R7b hold-to-talk (see the header comment)"
+#endif
+#define HAVE_SECRETS_H 1
+#else
+#define HAVE_SECRETS_H 0
 #endif
 
 /* Exported by the esp32-camera component (sccb.h is not a public header). Called a second
@@ -200,7 +221,7 @@
 extern "C" int SCCB_Deinit(void);
 
 static const char* SKETCH_NAME      = "R7_HermesTalk";
-static const char* SKETCH_VERSION   = "0.16.0";
+static const char* SKETCH_VERSION   = "0.17.0";
 static const uint16_t HTTP_PORT     = 8080;
 static const size_t MIN_TOKEN_LEN   = 16;
 static const size_t MAX_WAV_BYTES   = 192 * 1024;
@@ -337,8 +358,8 @@ static const char* voice_end   = "none";   // why it ended: quiet / max / no spe
 static int voice_loud_rms      = 0;        // loudest 100 ms piece of the last talk recording
 static int voice_floor_rms     = 0;        // quietest 100 ms piece of the last talk recording
 static int last_hook_code      = 0;
-static bool hook_ok            = false;    // secret and host set in secrets.h
-static IPAddress hook_ip;                  // resolved HERMES_HOOK_HOST; 0.0.0.0 = not yet
+static bool hook_ok            = false;    // secret and host set (saved settings or secrets.h)
+static IPAddress hook_ip;                  // resolved hook host; 0.0.0.0 = not yet
 static uint32_t boot_id        = 0;        // random per boot, part of each webhook's X-Request-ID
 static bool thinking           = false;
 static volatile bool hook_pending = false;  // the webhook task is running (v0.16.0)
@@ -421,6 +442,280 @@ static bool tokens_equal(const String& given, const char* expected)
     return diff == 0;
 }
 
+/* ---- v0.17.0: settings (saved on the robot, or secrets.h) and the USB setup protocol ---- */
+
+static const char* CFG_NS = "hermes";  // NVS namespace; the servo calibration lives in "servo"
+static RobotConfig cfg;                  // in use since boot
+static RobotConfig cfg_staged;           // SET values waiting for SAVE
+static bool cfg_staged_set[CFG_COUNT] = {};      // which CFG_FIELDS have been SET since the last SAVE/CLEAR
+static const char* cfg_source = "none";  // "saved", "secrets.h" or "none"
+static char serial_line[300];
+static size_t serial_len      = 0;
+static bool serial_overflow   = false;
+
+static char* cfg_field(RobotConfig& c, const CfgField& f)
+{
+    return (char*)&c + f.offset;
+}
+
+static bool printable_no_space(const char* v)
+{
+    for (; *v; v++) {
+        if (*v <= ' ' || *v > '~') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* nullptr if the value may be stored under this key, else why not */
+static const char* cfg_value_problem(const char* key, const char* v)
+{
+    size_t n = strlen(v);
+    if (!strcmp(key, "ssid")) {
+        if (n < 1 || n > 32) return "ssid must be 1-32 bytes";
+        for (const char* p = v; *p; p++) {
+            if ((unsigned char)*p < ' ' || *p == 0x7f) return "ssid has a control character";
+        }
+        return nullptr;
+    }
+    if (!strcmp(key, "pass")) {
+        if (n != 0 && (n < 8 || n > 64)) return "pass must be empty (open network) or 8-64 characters";
+        for (const char* p = v; *p; p++) {
+            if (*p < ' ' || *p > '~') return "pass must be printable ASCII";
+        }
+        return nullptr;
+    }
+    if (!strcmp(key, "token")) {
+        if (n < MIN_TOKEN_LEN || n > 128) return "token must be 16-128 characters";
+        return printable_no_space(v) ? nullptr : "token must be printable ASCII without spaces";
+    }
+    if (!strcmp(key, "hook_host")) {
+        if (n < 1 || n > 63) return "hook_host must be 1-63 characters";
+        for (const char* p = v; *p; p++) {
+            if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-') return "hook_host: letters, digits, '.', '-' only";
+        }
+        return nullptr;
+    }
+    if (!strcmp(key, "hook_secret")) {
+        if (n < MIN_HOOK_SECRET || n > 128) return "hook_secret must be 32-128 characters";
+        return printable_no_space(v) ? nullptr : "hook_secret must be printable ASCII without spaces";
+    }
+    return "unknown key";
+}
+
+/* Reads the "hermes" namespace; false if it is missing or any value is absent or bad */
+static bool cfg_load_saved(RobotConfig& c)
+{
+    nvs_handle_t h;
+    if (nvs_open(CFG_NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    bool ok = true;
+    for (const CfgField& f : CFG_FIELDS) {
+        size_t len = f.size;
+        char* dst  = cfg_field(c, f);
+        if (nvs_get_str(h, f.key, dst, &len) != ESP_OK || cfg_value_problem(f.key, dst)) {
+            ok = false;
+        }
+    }
+    nvs_close(h);
+    if (!ok) {
+        memset(&c, 0, sizeof(c));
+    }
+    return ok;
+}
+
+static void cfg_load()
+{
+    memset(&cfg, 0, sizeof(cfg));
+    if (cfg_load_saved(cfg)) {
+        cfg_source = "saved";
+    } else {
+#if HAVE_SECRETS_H
+        strlcpy(cfg.ssid, WIFI_SSID, sizeof(cfg.ssid));
+        strlcpy(cfg.pass, WIFI_PASSWORD, sizeof(cfg.pass));
+        strlcpy(cfg.token, HERMES_STATUS_TOKEN, sizeof(cfg.token));
+        strlcpy(cfg.hook_host, HERMES_HOOK_HOST, sizeof(cfg.hook_host));
+        strlcpy(cfg.hook_secret, HERMES_HOOK_SECRET, sizeof(cfg.hook_secret));
+        cfg_source = "secrets.h";
+        if (!strcmp(cfg.token, "REPLACE_WITH_A_LONG_RANDOM_TOKEN")) cfg.token[0] = '\0';
+        if (!strcmp(cfg.hook_secret, "REPLACE_WITH_THE_GATEWAY_ROUTE_SECRET")) cfg.hook_secret[0] = '\0';
+        if (!strcmp(cfg.ssid, "your-home-wifi-name")) cfg.ssid[0] = '\0';
+#else
+        cfg_source = "none";
+#endif
+    }
+    token_ok = !cfg_value_problem("token", cfg.token);
+    hook_ok  = !cfg_value_problem("hook_secret", cfg.hook_secret) && !cfg_value_problem("hook_host", cfg.hook_host);
+}
+
+static bool setup_needed()
+{
+    return !token_ok || cfg.ssid[0] == '\0';
+}
+
+static void cfg_unstage()
+{
+    memset(&cfg_staged, 0, sizeof(cfg_staged));
+    memset(cfg_staged_set, 0, sizeof(cfg_staged_set));
+}
+
+/* Writes all five staged values in one NVS commit; nullptr on success */
+static const char* cfg_save_staged()
+{
+    for (size_t i = 0; i < CFG_COUNT; i++) {
+        if (!cfg_staged_set[i]) {
+            return "SET all five keys first (ssid, pass, token, hook_host, hook_secret)";
+        }
+        const char* why = cfg_value_problem(CFG_FIELDS[i].key, cfg_field(cfg_staged, CFG_FIELDS[i]));
+        if (why) {
+            return why;
+        }
+    }
+    nvs_handle_t h;
+    if (nvs_open(CFG_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return "settings storage cannot be opened";
+    }
+    esp_err_t err = ESP_OK;
+    for (const CfgField& f : CFG_FIELDS) {
+        if (err == ESP_OK) {
+            err = nvs_set_str(h, f.key, cfg_field(cfg_staged, f));
+        }
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err == ESP_OK ? nullptr : "settings storage write failed";
+}
+
+static const char* cfg_clear_saved()
+{
+    nvs_handle_t h;
+    if (nvs_open(CFG_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return nullptr;  // nothing saved
+    }
+    esp_err_t err = nvs_erase_all(h);  // this namespace only
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err == ESP_OK ? nullptr : "settings storage erase failed";
+}
+
+static void serial_status()
+{
+    Serial.printf("@R7 OK STATUS sketch=%s version=%s settings=%s", SKETCH_NAME, SKETCH_VERSION, cfg_source);
+    for (const CfgField& f : CFG_FIELDS) {
+        const char* v = cfg_field(cfg, f);
+        if (!f.secret && v[0]) {
+            Serial.printf(" %s=\"%s\"", f.key, v);
+        } else {
+            Serial.printf(" %s=%s", f.key, v[0] ? "set" : "missing");
+        }
+        if (f.secret && v[0]) {
+            Serial.printf("(%u)", (unsigned)strlen(v));
+        }
+    }
+    Serial.printf(" token_ok=%d hook_ok=%d wifi=%s ip=%s staged=",
+                  token_ok, hook_ok, WiFi.status() == WL_CONNECTED ? "connected" : "not-connected",
+                  WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "none");
+    bool any = false;
+    for (size_t i = 0; i < CFG_COUNT; i++) {
+        if (cfg_staged_set[i]) {
+            Serial.printf("%s%s", any ? "," : "", CFG_FIELDS[i].key);
+            any = true;
+        }
+    }
+    Serial.printf("%s\n", any ? "" : "none");
+}
+
+static void serial_command(char* line)
+{
+    if (!strcmp(line, "HELLO")) {
+        Serial.printf("@R7 OK HELLO %s %s setup=1\n", SKETCH_NAME, SKETCH_VERSION);
+    } else if (!strcmp(line, "STATUS")) {
+        serial_status();
+    } else if (!strncmp(line, "SET ", 4)) {
+        char* key = line + 4;
+        char* val = strchr(key, ' ');
+        if (val) {
+            *val++ = '\0';  // the value is the rest of the line, spaces included (Wi-Fi names)
+        } else {
+            val = key + strlen(key);  // "SET pass" with nothing after = empty (open network)
+        }
+        const CfgField* field = nullptr;
+        size_t index          = 0;
+        for (size_t i = 0; i < CFG_COUNT; i++) {
+            if (!strcmp(CFG_FIELDS[i].key, key)) {
+                field = &CFG_FIELDS[i];
+                index = i;
+            }
+        }
+        const char* why = field ? cfg_value_problem(key, val) : "unknown key";
+        if (why) {
+            Serial.printf("@R7 ERR SET %s: %s\n", field ? field->key : "?", why);
+        } else {
+            strlcpy(cfg_field(cfg_staged, *field), val, field->size);
+            cfg_staged_set[index] = true;
+            Serial.printf("@R7 OK SET %s\n", field->key);
+        }
+    } else if (!strcmp(line, "SAVE")) {
+        const char* why = cfg_save_staged();
+        if (why) {
+            Serial.printf("@R7 ERR SAVE %s\n", why);
+        } else {
+            cfg_unstage();
+            Serial.printf("@R7 OK SAVE stored; REBOOT to use\n");
+        }
+    } else if (!strcmp(line, "CLEAR")) {
+        const char* why = cfg_clear_saved();
+        cfg_unstage();
+        if (why) {
+            Serial.printf("@R7 ERR CLEAR %s\n", why);
+        } else {
+            Serial.printf("@R7 OK CLEAR saved settings erased (servo calibration kept); REBOOT to use\n");
+        }
+    } else if (!strcmp(line, "REBOOT")) {
+        Serial.printf("@R7 OK REBOOT\n");
+        Serial.flush();
+        delay(200);
+        ESP.restart();
+    } else if (line[0]) {
+        Serial.printf("@R7 ERR unknown command (HELLO, STATUS, SET, SAVE, CLEAR, REBOOT)\n");
+    }
+}
+
+/* Called from loop(): collects one line at a time from the USB serial port */
+static void serial_tick()
+{
+    while (Serial.available() > 0) {
+        int ch = Serial.read();
+        if (ch < 0) {
+            break;
+        }
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            serial_line[serial_len] = '\0';
+            if (serial_overflow) {
+                Serial.printf("@R7 ERR line too long\n");
+            } else {
+                serial_command(serial_line);
+            }
+            memset(serial_line, 0, sizeof(serial_line));  // do not leave a secret in RAM longer than needed
+            serial_len      = 0;
+            serial_overflow = false;
+        } else if (serial_len < sizeof(serial_line) - 1) {
+            serial_line[serial_len++] = (char)ch;
+        } else {
+            serial_overflow = true;
+        }
+    }
+}
+
 static bool is_authorized()
 {
     if (!token_ok || !server.hasHeader("Authorization")) {
@@ -430,7 +725,7 @@ static bool is_authorized()
     if (!header.startsWith("Bearer ")) {
         return false;
     }
-    return tokens_equal(header.substring(7), HERMES_STATUS_TOKEN);
+    return tokens_equal(header.substring(7), cfg.token);
 }
 
 static void send_json_error(int code, const char* msg)
@@ -950,7 +1245,7 @@ static void handle_status()
              "\"voice_len_ms\":%lu,\"voice_end\":\"%s\",\"voice_loud_rms\":%d,\"voice_floor_rms\":%d,"
              "\"last_hook_code\":%d,\"hook_ok\":%s,\"hook_ip_known\":%s,\"clock_ok\":%s,"
              "\"idle\":%s,\"face\":%s,\"idle_glances\":%lu,"
-             "\"requests_served\":%lu}",
+             "\"settings\":\"%s\",\"requests_served\":%lu}",
              SKETCH_NAME, SKETCH_VERSION, (unsigned long)(millis() / 1000), voltage, current_ma,
              (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap(), SPEAKER_VOLUME,
              (unsigned long)clips_spoken, (unsigned long)moves_done, angles_known ? "true" : "false",
@@ -968,7 +1263,7 @@ static void handle_status()
              last_hook_code, hook_ok ? "true" : "false",
              hook_ip_known() ? "true" : "false", clock_ok() ? "true" : "false",
              idle_on ? "true" : "false", face_shown ? "true" : "false", (unsigned long)idle_glances,
-             (unsigned long)(requests_served + 1));
+             cfg_source, (unsigned long)(requests_served + 1));
 
     requests_served++;
     server.send(200, "application/json", body);
@@ -1661,7 +1956,7 @@ static void show_notice(const char* reason)
 /* "name.local" through mDNS, anything else through DNS */
 static bool resolve_hook_host()
 {
-    String host = HERMES_HOOK_HOST;
+    String host = cfg.hook_host;
     IPAddress ip((uint32_t)0);
     if (host.endsWith(".local")) {
         ip = MDNS.queryHost(host.substring(0, host.length() - 6).c_str(), 2000);
@@ -1677,7 +1972,7 @@ static bool sign_hook(const char* ts, const char* body, char hex[65])
     String msg = String(ts) + "." + body;
     uint8_t mac[32];
     const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (!md || mbedtls_md_hmac(md, (const uint8_t*)HERMES_HOOK_SECRET, strlen(HERMES_HOOK_SECRET),
+    if (!md || mbedtls_md_hmac(md, (const uint8_t*)cfg.hook_secret, strlen(cfg.hook_secret),
                                (const uint8_t*)msg.c_str(), msg.length(), mac) != 0) {
         return false;
     }
@@ -2192,9 +2487,9 @@ static void render_status(LovyanGFX& d)
     d.printf("views %lu  touch %s\n", (unsigned long)views_started, touch_chip_ok() ? "ok" : "NO");
     d.printf("talk %lu  clock %s\n", (unsigned long)voices_sent, clock_ok() ? "ok" : "NO");
 
-    if (!token_ok) {
-        d.setTextColor(TFT_RED);
-        d.printf("TOKEN NOT SET (secrets.h)\n");
+    if (setup_needed()) {
+        d.setTextColor(TFT_ORANGE);
+        d.printf("SETUP NEEDED: connect USB,\nrun stackchan-setup.py\n");
     }
     if (!wav_buf) {
         d.setTextColor(TFT_RED);
@@ -2216,9 +2511,9 @@ static void render_status(LovyanGFX& d)
         d.setTextColor(TFT_RED);
         d.printf("NO SCREEN BUFFERS\n");
     }
-    if (!hook_ok) {
+    if (!hook_ok && !setup_needed()) {
         d.setTextColor(TFT_RED);
-        d.printf("TALK OFF (secrets.h)\n");
+        d.printf("TALK OFF (hook settings)\n");
     }
 }
 
@@ -2261,22 +2556,20 @@ void setup()
         c->setTextSize(2);
     }
 
-    token_ok = strlen(HERMES_STATUS_TOKEN) >= MIN_TOKEN_LEN &&
-               strcmp(HERMES_STATUS_TOKEN, "REPLACE_WITH_A_LONG_RANDOM_TOKEN") != 0;
-
-    hook_ok = strlen(HERMES_HOOK_SECRET) >= MIN_HOOK_SECRET && strlen(HERMES_HOOK_HOST) > 0 &&
-              strcmp(HERMES_HOOK_SECRET, "REPLACE_WITH_THE_GATEWAY_ROUTE_SECRET") != 0;
+    cfg_load();  // v0.17.0: saved settings, else secrets.h; sets token_ok and hook_ok
     boot_id = esp_random();
 
     wav_buf = (uint8_t*)heap_caps_malloc(MAX_WAV_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-        delay(250);
+    if (cfg.ssid[0]) {
+        WiFi.begin(cfg.ssid, cfg.pass);
+        uint32_t start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+            serial_tick();  // setup works while Wi-Fi is still trying
+            delay(250);
+        }
     }
 
     /* R7b: UTC from NTP for webhook timestamps (set in the background); mDNS to find the Mac */
@@ -2307,9 +2600,9 @@ void setup()
         touch_recalibrate();
     }
 
-    Serial.printf("[R7] %s ready, ip=%s port=%u token_ok=%d wav_buf=%d screen_ok=%d touch_ok=%d hook_ok=%d mac=%s\n",
-                  SKETCH_NAME, WiFi.localIP().toString().c_str(), HTTP_PORT, token_ok, wav_buf != nullptr, screen_ok,
-                  touch_ok, hook_ok, hook_ip.toString().c_str());
+    Serial.printf("[R7] %s ready, ip=%s port=%u settings=%s token_ok=%d wav_buf=%d screen_ok=%d touch_ok=%d hook_ok=%d mac=%s\n",
+                  SKETCH_NAME, WiFi.localIP().toString().c_str(), HTTP_PORT, cfg_source, token_ok, wav_buf != nullptr,
+                  screen_ok, touch_ok, hook_ok, hook_ip.toString().c_str());
     draw_screen();
 }
 
@@ -2317,6 +2610,7 @@ void loop()
 {
     M5StackChan.update();
     check_touch();
+    serial_tick();
     server.handleClient();
     view_tick();
     voice_tick();
