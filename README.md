@@ -74,6 +74,7 @@ build on earlier ones, and the robot runs one sketch at a time.
 | `R6_HermesTouch/` | R6 | Head taps, QUIET mode, first `stackchan` MCP tool server |
 | `R7_HermesTalk/` | R7 | **Current.** Sprite screen, live camera view, tap-to-talk via webhook |
 | `SimpleServoBehavior/` | — | Early standalone servo test |
+| `tools/` | — | `stackchan-setup.py` (robot settings over USB), `build-release.sh` (release firmware) |
 
 Other Mac-side scripts in `R7_HermesTalk/`:
 
@@ -89,13 +90,13 @@ Other Mac-side scripts in `R7_HermesTalk/`:
 **Hardware:** M5Stack StackChan (CoreS3 controller, head servos, camera, microphone, touch sensor)
 and a Mac on the same Wi-Fi network.
 
-**Robot side:** Arduino IDE 2.x or `arduino-cli` with
+**Robot side:** a prebuilt release flashed with `esptool` (see [RELEASE.md](RELEASE.md)), or Arduino IDE 2.x or `arduino-cli` with
 
 | Component | Version used |
 |---|---|
 | Board package | Espressif `esp32` 3.3.12, board `esp32:esp32:m5stack_cores3` |
 | M5StackChan | 1.1.1 |
-| M5Unified / M5GFX | 0.2.28 / 0.2.35 |
+| M5Unified / M5GFX | 0.2.29 / 0.2.36 |
 
 **Mac side** (scripts assume macOS: Keychain, `say`, Bonjour):
 
@@ -167,6 +168,10 @@ free plan. `hermes gateway status` should say the gateway is supervised by launc
 not, run `hermes gateway install`.
 
 ### 4. Secrets (once per robot)
+
+**No Arduino IDE?** Flash a release and let `tools/stackchan-setup.py` do steps 4 and 5 for
+you: see [RELEASE.md](RELEASE.md), then continue at step 6. With firmware v0.17.0 or later
+the script also works after an Arduino upload, instead of writing `secrets.h`.
 
 Make two random values. Keep this Terminal window private and close it afterwards.
 

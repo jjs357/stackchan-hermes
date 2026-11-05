@@ -33,3 +33,6 @@ R7_HermesTalk/eval/run/
 
 # Per-robot settings: copy each rN.conf.example to rN.conf and set ROBOT_IP
 R*/r*.conf
+
+# Release builds (tools/build-release.sh); attached to GitHub Releases, not committed
+dist/
