@@ -61,7 +61,7 @@ PORT=/dev/cu.usbmodem1101            # use the name shown above
 ```
 
 If nothing appears, try another cable. If esptool later says it cannot connect, put the robot
-in download mode: hold the reset button on the side for about 2 seconds, until the small
+in download mode: press and hold the reset button on the side for about 3 seconds, until the small
 green light comes on. Then run the command again.
 
 ## 4. Back up the settings area
@@ -114,7 +114,27 @@ The script:
 
 If the script says the webhook secret changed, run `hermes gateway restart`.
 
+Then **unplug the USB cable, switch the robot off, wait about 10 seconds and switch it on
+again, without touching its head while it starts.** The head sensor takes its "untouched"
+reading at start-up. In testing, a robot that was last started by esptool and the setup script
+with the cable attached kept "feeling" touches nobody made, and each one started a recording
+(the MIC REC banner). A clean power-on fixed it. Holding the screen turns on QUIET mode, which
+stops talk recordings until you hold it again.
+
 Then continue with **README step 6** (Hermes profiles). README step 8 has the checks.
+
+### Which clone the robot address goes into
+
+The script writes the robot's address into the `rN.conf` files of **the clone you run it
+from**. The Mac that runs the Hermes gateway fetches clips and sends speech through the
+clone that its `stackchan` profile points to (the paths in README step 6). With one robot and
+one clone, that's the same place. If you run the script from a different clone, or set up a
+second robot, the gateway still talks to the address in its own clone. Talk then fails: the
+robot shows THINKING, and Hermes reports "no clip: no reply". Restarting the gateway does not help.
+Fix it by setting `ROBOT_IP` in that clone's `rN.conf` files.
+
+A gateway serves one robot at a time. For a second robot, use a separate clone for its setup.
+Then point the gateway Mac's `rN.conf` files at whichever robot you are using.
 
 ## Later changes
 
@@ -125,6 +145,7 @@ Then continue with **README step 6** (Hermes profiles). README step 8 has the ch
 | Make new secrets | `tools/stackchan-setup.py --new-secrets`, then `hermes gateway restart` |
 | Install a newer release | Steps 2, 3 and 5. The settings stay on the robot. |
 | Go back to an Arduino build with `secrets.h` | `tools/stackchan-setup.py --clear`. Saved settings always win over `secrets.h`. |
+| Go back to M5Stack's factory firmware | Use M5Stack's web-based burner in Chrome (the M5Burner desktop app is being discontinued). If the burner does not see the robot, press and hold the reset button for about 3 seconds first. The settings area's start, and with it the servo calibration, stayed in place in our test. |
 
 ## Safety notes
 
@@ -137,11 +158,26 @@ Then continue with **README step 6** (Hermes profiles). README step 8 has the ch
 
 ## Known limits
 
-- These steps were tested on a StackChan that had already been flashed from the Arduino IDE (the
-  board's default 16 MB layout). A robot still running **M5Stack's factory firmware** may use a
-  different flash layout. It has not been tested, and its servo calibration might sit somewhere
-  else. Make the backup in step 4 first. If you are unsure, build and upload once with the
-  Arduino IDE (README step 5), then use releases after that.
+- Tested on two StackChans:
+  - one that had been flashed from the Arduino IDE (the board's default 16 MB layout)
+  - one freshly restored to **M5Stack's factory firmware**
+
+  The factory firmware uses a different flash layout:
+
+  | | Factory | Release |
+  |---|---|---|
+  | Settings area | 16 KB | 20 KB |
+  | OTA data | 0xD000 | 0xE000 |
+  | Firmware start | 0x20000 | 0x10000 |
+
+  Both settings areas start at 0x9000. After the flash, the factory robot kept its settings
+  entries, including the servo calibration. The leftover factory block at 0xD000 is ignored
+  by the settings system.
+- Both test robots had the M5StackChan library's default calibration (yaw 460, pitch 620). A
+  robot calibrated by hand has not been tested, which is one more reason to make the backup in
+  step 4.
+- `tools/stackchan-setup.py` sets up one robot per clone (see "Which clone the robot address
+  goes into").
 
 ## For maintainers: building a release
 
