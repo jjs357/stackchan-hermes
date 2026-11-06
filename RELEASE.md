@@ -136,6 +136,18 @@ Fix it by setting `ROBOT_IP` in that clone's `rN.conf` files.
 A gateway serves one robot at a time. For a second robot, use a separate clone for its setup.
 Then point the gateway Mac's `rN.conf` files at whichever robot you are using.
 
+**Two robots at once** work if each has its own Mac (tested):
+- Give each robot its Mac's address with `--host`.
+- Point each Mac's `rN.conf` files at its own robot.
+
+Notes:
+- The robots can share the token and webhook secret.
+- Both advertise `stackchan.local`, which does not matter because the scripts use IP
+  addresses.
+- Each Mac keeps its own short conversation memory, so each robot remembers only its own
+  exchanges.
+- Keep the robots apart: one robot's speech can end up in the other's recording.
+
 ## Later changes
 
 | You want to | Do this |

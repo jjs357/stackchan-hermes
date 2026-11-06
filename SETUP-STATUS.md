@@ -7,6 +7,7 @@ Last updated: 2026-11-06 · R1–R7a complete · R7b core complete (robot on R7_
 - Two problems found, both now in RELEASE.md:
   - The setup script was run from a separate clone, so the gateway Mac's own `rN.conf` still pointed at robot 1 (switched off). Every clip fetch timed out ("no clip: no reply"), and a gateway restart could not help. The script writes the address only into the clone it runs from.
   - Right after esptool and the setup script, with the USB cable attached, the head sensor reported touches nobody made: 8 of 15 recordings were near-silent, one with nobody near the robot. A full power-off and a start on battery, hands off the head, fixed it (0 recordings in 3+ min).
+- Two robots at once, each with its own Mac (robot 1 → second Mac, robot 2 → first Mac): both answered by their own Mac, no crossover. RELEASE.md says how
 - RELEASE.md now covers: power-cycling after setup, which clone gets the robot address, returning to factory firmware (web burner, hold reset ~3 s), and the factory-firmware result
 
 **Earlier (2026-11-05):**
